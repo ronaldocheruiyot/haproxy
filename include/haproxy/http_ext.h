@@ -35,7 +35,7 @@ int http_handle_xot_header(struct stream *s, struct channel *req);
 
 int proxy_http_parse_7239(char **args, int cur_arg, struct proxy *curproxy, const struct proxy *defpx, const char *file, int linenum);
 int proxy_http_compile_7239(struct proxy *curproxy);
-int proxy_http_parse_xff(char **args, int cur_arg, struct proxy *curproxy, const struct proxy *defpx, const char *file, int linenum);
+int proxy_http_parse_xff(char **args, int kwm, struct proxy *curproxy, const struct proxy *defpx, const char *file, int linenum);
 int proxy_http_parse_xot(char **args, int cur_arg, struct proxy *curproxy, const struct proxy *defpx, const char *file, int linenum);
 
 int http_ext_7239_prepare(struct proxy *cur);

@@ -2440,7 +2440,7 @@ stats_error_parsing:
 				goto out;
 		}
 		else if (strcmp(args[1], "forwardfor") == 0) {
-			err_code |= proxy_http_parse_xff(args, 0, curproxy, curr_defproxy, file, linenum);
+			err_code |= proxy_http_parse_xff(args, kwm, curproxy, curr_defproxy, file, linenum);
 			if (err_code & ERR_FATAL)
 				goto out;
 		}

@@ -1215,17 +1215,28 @@ int proxy_http_compile_7239(struct proxy *curproxy)
 /* x-forwarded-for: tries to parse "option forwardfor" config keyword
  * Returns a composition of ERR_NONE, ERR_FATAL, ERR_ALERT
  */
-int proxy_http_parse_xff(char **args, int cur_arg,
+int proxy_http_parse_xff(char **args, int kwm,
                          struct proxy *curproxy, const struct proxy *defpx,
                          const char *file, int linenum)
 {
-	struct http_ext_xff *xff;
+	struct http_ext_xff *xff = NULL;
 	int err_code = 0;
+	int cur_arg;
 
 	if (!http_ext_xff_prepare(curproxy))
 		return proxy_http_parse_oom(file, linenum);
-
+		
 	xff = curproxy->http_ext->xff;
+
+	/* Handle option inversion ('no option forwardfor') */
+	if (kwm == KWM_NO) {
+		if (xff){
+			xff->mode = 0;
+			istfree(&xff->hdr_name);    
+			xff->except_net.family = AF_UNSPEC; 
+		}
+		return ERR_NONE;              
+	}
 
 	/* insert x-forwarded-for field, but not for the IP address listed as an except.
 	 * set default options (ie: bitfield, header name, etc)
