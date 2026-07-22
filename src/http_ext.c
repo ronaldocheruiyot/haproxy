@@ -1223,20 +1223,21 @@ int proxy_http_parse_xff(char **args, int kwm,
 	int err_code = 0;
 	int cur_arg;
 
-	if (!http_ext_xff_prepare(curproxy))
-		return proxy_http_parse_oom(file, linenum);
-		
-	xff = curproxy->http_ext->xff;
-
 	/* Handle option inversion ('no option forwardfor') */
 	if (kwm == KWM_NO) {
-		if (xff){
-			xff->mode = 0;
-			istfree(&xff->hdr_name);    
-			xff->except_net.family = AF_UNSPEC; 
+		if (curproxy->http_ext && curproxy->http_ext->xff){
+			xff = curproxy->http_ext->xff;
+			istfree(&xff->hdr_name);
+			free(xff);    
+			curproxy->http_ext->xff = NULL; 
 		}
 		return ERR_NONE;              
 	}
+	
+	if (!http_ext_xff_prepare(curproxy))
+		return proxy_http_parse_oom(file, linenum);
+	
+	xff = curproxy->http_ext->xff;
 
 	/* insert x-forwarded-for field, but not for the IP address listed as an except.
 	 * set default options (ie: bitfield, header name, etc)

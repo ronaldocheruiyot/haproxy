@@ -2148,6 +2148,11 @@ stats_error_parsing:
 				goto out;
 			}
 		}
+		else if (strcmp(args[1], "forwardfor") == 0) {
+            err_code |= proxy_http_parse_xff(args, kwm, curproxy, curr_defproxy, file, linenum);
+            if (err_code & ERR_FATAL)
+                goto out;
+        }
 		else if (strcmp(args[1], "http-tunnel") == 0) {
 			ha_alert("parsing [%s:%d]: option '%s' is not supported any more since HAProxy 2.1, please just remove it, it shouldn't be needed.\n",
 				 file, linenum, args[1]);

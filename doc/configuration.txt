@@ -10469,6 +10469,7 @@ no option forwarded
   See also : "option forwardfor", "option originalto"
 
 option forwardfor [ except <network> ] [ header <name> ] [ if-none ]
+no option forwardfor
   Enable insertion of the X-Forwarded-For header to requests sent to servers
 
   May be used in the following contexts: http
@@ -10481,6 +10482,10 @@ option forwardfor [ except <network> ] [ header <name> ] [ if-none ]
               matching <network>
     <name>    an optional argument to specify a different "X-Forwarded-For"
               header name.
+  'no option forwardfor' resets any 'option forwardfor' setting inherited from
+  a 'defaults' section or previously defined in the same proxy section. Note
+  that it does not explicitly block header insertion if 'option forwardfor'
+  is configured on a connected frontend or backend section.
 
   Since HAProxy works in reverse-proxy mode, the servers see its IP address as
   their client address. This is sometimes annoying when the client's IP address
