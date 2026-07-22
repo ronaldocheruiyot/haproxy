@@ -150,6 +150,7 @@ int  pidfd = -1;		/* FD to keep PID */
 int daemon_fd[2] = {-1, -1};	/* pipe to communicate with parent process */
 int devnullfd = -1;
 int fileless_mode;
+int no_listener_mode;
 struct cfgfile fileless_cfg;
 extern __attribute__((weak)) void haproxy_init_args(int argc, char **argv);
 extern __attribute__((weak)) char **copy_argv(int argc, char **argv);
@@ -746,7 +747,9 @@ static void usage(char *name)
 		"        -vq/-vqs/-vqb only displays version, short version, branch.\n"
 		"        -d enters debug mode ; -db only disables background mode.\n"
 		"        -dM[<byte>,help,...] debug memory (default: poison with <byte>/0x50)\n"
+#if defined(USE_TRACE)
 		"        -dt activate traces on stderr; see '-dt help'\n"
+#endif
 		"        -V enters verbose mode (disables quiet mode)\n"
 		"        -D goes daemon ; -C changes to <dir> before loading files.\n"
 		"        -W master-worker mode.\n"
@@ -1646,6 +1649,7 @@ void haproxy_init_args(int argc, char **argv)
 				arg_mode |= MODE_DUMP_KWD;
 				kwd_dump = flag + 2;
 			}
+#if defined(USE_TRACE)
 			else if (*flag == 'd' && flag[1] == 't') {
 				char *arg = flag + 2;
 				int ret;
@@ -1662,6 +1666,7 @@ void haproxy_init_args(int argc, char **argv)
 					exit(EXIT_FAILURE);
 				}
 			}
+#endif
 #ifdef HA_USE_KTLS
 			else if (*flag == 'd' && flag[1] == 'T') {
 				global.tune.options |= GTUNE_NO_KTLS;
@@ -3634,7 +3639,9 @@ int main(int argc, char **argv)
 		list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list)
 			ha_free(&cfg->content);
 
+#if defined(USE_TRACE)
 		trace_parse_cmds();
+#endif
 		usermsgs_clr(NULL);
 	}
 
@@ -3681,7 +3688,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Exit in standalone mode, if no listeners found */
-	if (!(global.mode & MODE_MWORKER) && listeners == 0) {
+	if (!(global.mode & MODE_MWORKER) && !no_listener_mode && listeners == 0) {
 		ha_alert("[%s.main()] No enabled listener found (check for 'bind' directives) ! Exiting.\n", argv[0]);
 		/* Note: we don't have to send anything to the old pids because we
 		 * never stopped them. */

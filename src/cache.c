@@ -41,6 +41,18 @@
 					       * the filter keyword) */
 #define CACHE_FLT_INIT             0x00000002 /* Whether the cache name was freed. */
 
+/* Flags for cached entries. */
+#define CACHE_EF_COMPLETE          0x00000001 /* fully written and valid */
+#define CACHE_EF_STRIPPED          0x00000002 /* entry stripped, only early hints data remains */
+
+/* Flags for configuration. */
+#define CACHE_CF_VARY_PROCESSING   0x00000001 /* manage Vary header (disabled by default) */
+#define CACHE_CF_EARLY_HINTS       0x00000002 /* enable HTTP 103 Early Hints (disabled by default) */
+#define CACHE_CF_EARLY_HINTS_ONLY  0x00000004 /* skip body storage; implies CACHE_CF_EARLY_HINTS */
+
+/* Soft cap on the number of cache blocks that may be held by hints entries. */
+#define CACHE_HINTS_CAP(cache)     ((cache)->maxblocks * (cache)->early_hints_ratio / 100)
+
 static uint64_t cache_hash_seed = 0;
 
 const char *cache_store_flt_id = "cache store filter";
@@ -60,11 +72,15 @@ struct cache_tree {
 struct cache {
 	struct cache_tree trees[CACHE_TREE_NUM];
 	struct list list;        /* cache linked list */
+	struct list full_lru;    /* LRU list of full entries */
+	struct list hints_lru;   /* LRU list of hints entries */
+	unsigned int hints_blocks;  /* sum of block counts of hints entries */
 	unsigned int maxage;     /* max-age */
 	unsigned int maxblocks;
 	unsigned int maxobjsz;   /* max-object-size (in bytes) */
 	unsigned int max_secondary_entries;  /* maximum number of secondary entries with the same primary hash */
-	uint8_t vary_processing_enabled;     /* boolean : manage Vary header (disabled by default) */
+	uint8_t flags;           /* configuration flags, see CACHE_CF_* */
+	uint8_t early_hints_ratio;           /* percentage of cache reserved for hints entries (1..99) */
 	char id[33];             /* cache name */
 };
 
@@ -191,7 +207,7 @@ struct cache_st {
 #define DEFAULT_MAX_SECONDARY_ENTRY 10
 
 struct cache_entry {
-	unsigned int complete;    /* An entry won't be valid until complete is not null. */
+	unsigned int flags;       /* Cache entry flags. See CACHE_EF_* */
 	unsigned int latest_validation;     /* latest validation date */
 	unsigned int expire;      /* expiration date (wall clock time) */
 	unsigned int age;         /* Origin server "Age" header value */
@@ -202,6 +218,7 @@ struct cache_entry {
 	char hash[20];
 
 	struct list cleanup_list;/* List used between the cache_free_blocks and cache_reserve_finish calls */
+	struct list lru;         /* Link in the cache's full_lru or hints_lru */
 
 	char secondary_key[HTTP_CACHE_SEC_KEY_LEN];  /* Optional secondary key. */
 	unsigned int secondary_key_signature;  /* Bitfield of the HTTP headers that should be used
@@ -225,6 +242,9 @@ struct cache_entry {
 #define CACHE_BLOCKSIZE 1024
 #define CACHE_ENTRY_MAX_AGE 2147483648U
 
+/* Maximum size of a single Link header value for hint extraction. */
+#define CACHE_MAX_HINT_LINK_VAL 1024
+
 static struct list caches = LIST_HEAD_INIT(caches);
 static struct list caches_config = LIST_HEAD_INIT(caches_config); /* cache config to init */
 static struct cache *tmp_cache_config = NULL;
@@ -237,11 +257,11 @@ static inline void release_entry_locked(struct cache_tree *cache, struct cache_e
 static inline void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
 
 /*
- * Find a cache_entry in the <cache>'s tree that has the hash <hash>.
- * If <delete_expired> is 0 then the entry is left untouched if it is found but
- * is already expired, and NULL is returned. Otherwise, the expired entry is
- * removed from the tree and NULL is returned.
- * Returns a valid (not expired) cache_tree pointer.
+ * Find a cache_entry in <cache_tree> that has the hash <hash>. If
+ * <delete_expired> is non-zero and the entry is expired, it is removed from
+ * the tree and NULL is returned. Otherwise the entry is returned as-is,
+ * including expired entries when <delete_expired> is 0 - the caller is then
+ * responsible for inspecting entry->expire.
  * The returned entry is not retained, it should be explicitly retained only
  * when necessary.
  *
@@ -263,12 +283,11 @@ struct cache_entry *get_entry(struct cache_tree *cache_tree, char *hash, int del
 	if (memcmp(entry->hash, hash, sizeof(entry->hash)))
 		return NULL;
 
-	if (entry->expire > date.tv_sec) {
-		return entry;
-	} else if (delete_expired) {
+	if (delete_expired && entry->expire <= date.tv_sec) {
 		release_entry_locked(cache_tree, entry);
+		return NULL;
 	}
-	return NULL;
+	return entry;
 }
 
 /*
@@ -574,7 +593,32 @@ static inline struct shared_block *block_ptr(struct cache_entry *entry)
 	return (struct shared_block *)((unsigned char *)entry - offsetof(struct shared_block, data));
 }
 
+/*
+ * Reattach a row that the cache had detached for reading or writing, and
+ * ensure the corresponding entry is at the tail of its appropriate LRU. If
+ * the entry is not yet in any LRU and is complete, it is inserted; otherwise
+ * it is moved to the tail. LRU bookkeeping is skipped when the cache has
+ * early-hints disabled. Must be called under shctx wrlock.
+ */
+static inline void cache_row_reattach(struct cache *cache, struct shared_block *first)
+{
+	struct cache_entry *entry = (struct cache_entry *)first->data;
 
+	if ((cache->flags & CACHE_CF_EARLY_HINTS) &&
+	    (LIST_INLIST(&entry->lru) || (entry->flags & CACHE_EF_COMPLETE))) {
+		struct list *lru;
+
+		if (entry->flags & CACHE_EF_STRIPPED)
+			lru = &cache->hints_lru;
+		else
+			lru = &cache->full_lru;
+
+		if (LIST_INLIST(&entry->lru))
+			LIST_DELETE(&entry->lru);
+		LIST_APPEND(lru, &entry->lru);
+	}
+	shctx_row_reattach(shctx_ptr(cache), first);
+}
 
 static int
 cache_store_init(struct proxy *px, struct flt_conf *fconf)
@@ -634,8 +678,10 @@ cache_store_check(struct proxy *px, struct flt_conf *fconf)
 		}
 		else if (f->id == http_comp_req_flt_id || f->id == http_comp_res_flt_id)
 			comp = 1;
+#if defined(USE_FCGI)
 		else if (f->id == fcgi_flt_id)
 			continue;
+#endif
 		else if ((f->id != fconf->id) && (cconf->flags & CACHE_FLT_F_IMPLICIT_DECL)) {
 			/* Implicit declaration is only allowed with the
 			 * compression and fcgi. For other filters, an implicit
@@ -678,7 +724,7 @@ cache_store_strm_deinit(struct stream *s, struct filter *filter)
 	 * there too, in case of errors */
 	if (st && st->first_block) {
 		struct cache_entry *object = (struct cache_entry *)st->first_block->data;
-		if (!object->complete) {
+		if (!(object->flags & CACHE_EF_COMPLETE)) {
 			/* The stream was closed but the 'complete' flag was not
 			 * set which means that cache_store_http_end was not
 			 * called. The stream must have been closed before we
@@ -687,7 +733,7 @@ cache_store_strm_deinit(struct stream *s, struct filter *filter)
 			release_entry_unlocked(&cache->trees[object->eb.key % CACHE_TREE_NUM], object);
 		}
 		shctx_wrlock(shctx);
-		shctx_row_reattach(shctx, st->first_block);
+		cache_row_reattach(cache, st->first_block);
 		shctx_wrunlock(shctx);
 	}
 	if (st) {
@@ -745,7 +791,7 @@ static inline void disable_cache_entry(struct cache_st *st,
 	filter->ctx = NULL; /* disable cache  */
 	release_entry_unlocked(&cache->trees[object->eb.key % CACHE_TREE_NUM], object);
 	shctx_wrlock(shctx);
-	shctx_row_reattach(shctx, st->first_block);
+	cache_row_reattach(cache, st->first_block);
 	shctx_wrunlock(shctx);
 	pool_free(pool_head_cache_st, st);
 }
@@ -860,9 +906,9 @@ cache_store_http_end(struct stream *s, struct filter *filter,
 
 		shctx_wrlock(shctx);
 		/* The whole payload was cached, the entry can now be used. */
-		object->complete = 1;
+		object->flags |= CACHE_EF_COMPLETE;
 		/* remove from the hotlist */
-		shctx_row_reattach(shctx, st->first_block);
+		cache_row_reattach(cache, st->first_block);
 		shctx_wrunlock(shctx);
 
 	}
@@ -1016,6 +1062,86 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 
 }
 
+/* The rel values in Link headers for which sending a 103 response makes sense. */
+static const struct ist hint_rels[] = {
+	IST("preload"),
+	IST("preconnect"),
+	IST("dns-prefetch"),
+	IST("modulepreload"),
+	IST("prefetch"),
+};
+
+static int rel_is_hint(const struct ist rel)
+{
+	int i;
+
+	for (i = 0; i < sizeof(hint_rels) / sizeof(*hint_rels); i++) {
+		if (isteqi(rel, hint_rels[i]))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Returns true if the value of the Link header contains at least one rel attribute
+ * worth sending in a 103 Early Hint response.
+ */
+static int link_is_hint(struct ist val)
+{
+	const char *p = istptr(val), *end = istend(val);
+	struct ist params, pname, pval;
+
+	/* A link-value must start with a "<URI>" part (RFC 8288#3). */
+	if (p >= end || *p != '<')
+		return 0;
+
+	/* Skip past the <URI> portion to reach the parameter list. */
+	while (p < end && *p != '>')
+		p++;
+	if (p < end)
+		p++;
+	params = ist2(p, end - p);
+
+	while (http_get_hdr_param(&params, &pname, &pval,
+	                          HTTP_PARAM_BADWS | HTTP_PARAM_NOVAL) > 0) {
+		if (!isteqi(pname, ist("rel")))
+			continue;
+
+		/* Only the first rel parameter counts: per RFC 8288#3.3,
+		 * parsers must ignore subsequent occurrences. Whatever the
+		 * outcome below, we are done with this link-value.
+		 *
+		 * Per RFC 8288#3.3 the rel value carries only tokens, optionally
+		 * separated by SP. Leading or trailing whitespace inside a quoted
+		 * value is malformed; reject the whole rel parameter rather than
+		 * silently tolerating it (cf. RFC 9110#5.6.3).
+		 */
+		if (!pval.len || HTTP_IS_LWS(*istptr(pval)) ||
+		    HTTP_IS_LWS(istptr(pval)[pval.len - 1]))
+			return 0;
+
+		while (pval.len) {
+			const char *tp = istptr(pval), *tend = istend(pval);
+			const char *tok;
+			struct ist token;
+
+			tok = tp;
+			while (tp < tend && !HTTP_IS_LWS(*tp))
+				tp++;
+			token = ist2(tok, tp - tok);
+
+			if (rel_is_hint(token))
+				return 1;
+
+			while (tp < tend && HTTP_IS_LWS(*tp))
+				tp++;
+			pval = ist2(tp, tend - tp);
+		}
+		return 0;
+	}
+
+	return 0;
+}
 
 static void cache_free_blocks(struct shared_block *first, void *data)
 {
@@ -1023,14 +1149,257 @@ static void cache_free_blocks(struct shared_block *first, void *data)
 	struct cache *cache = (struct cache *)data;
 	struct cache_tree *cache_tree;
 
+	if (LIST_INLIST(&object->lru)) {
+		LIST_DEL_INIT(&object->lru);
+		if (object->flags & CACHE_EF_STRIPPED)
+			cache->hints_blocks -= first->block_count;
+	}
+
 	if (object->eb.key) {
-		object->complete = 0;
+		object->flags &= ~(CACHE_EF_COMPLETE | CACHE_EF_STRIPPED);
 		cache_tree = &cache->trees[object->eb.key % CACHE_TREE_NUM];
 		retain_entry(object);
 		HA_SPIN_LOCK(CACHE_LOCK, &cache_tree->cleanup_lock);
 		LIST_INSERT(&cache_tree->cleanup_list, &object->cleanup_list);
 		HA_SPIN_UNLOCK(CACHE_LOCK, &cache_tree->cleanup_lock);
 	}
+}
+
+static void cache_extract_link_hints(struct ist link, struct buffer *hint_buf)
+{
+	struct ist lv;
+	size_t hdr_start = b_data(hint_buf);
+	uint16_t hdr_len = 0;
+
+	if (b_data(hint_buf) + sizeof(hdr_len) > b_size(hint_buf))
+		return;
+
+	hint_buf->data += sizeof(hdr_len);
+
+	while (http_next_hdr_value(&link, &lv)) {
+		size_t needed = lv.len;
+
+		if (!link_is_hint(lv))
+			continue;
+		if (hdr_len > 0)
+			needed += 2;
+		if (hdr_len + needed > UINT16_MAX)
+			continue;
+		if (b_data(hint_buf) + needed > b_size(hint_buf))
+			continue;
+
+		if (hdr_len > 0) {
+			chunk_memcat(hint_buf, ", ", 2);
+			hdr_len += 2;
+		}
+		chunk_memcat(hint_buf, lv.ptr, lv.len);
+		hdr_len += lv.len;
+	}
+
+	/* If we wrote anything in the hint buffer, encode the length of the
+	 * data at the beginning, and if we didn't, reset the buffer pointer to
+	 * its previous state (before the 2 bytes we initially reserved).
+	 */
+	if (hdr_len == 0)
+		hint_buf->data -= sizeof(hdr_len);
+	else
+		memcpy(b_orig(hint_buf) + hdr_start, &hdr_len, sizeof(hdr_len));
+}
+
+/*
+ * Walk the HTX header blocks and accumulate Link values relevant for early
+ * hints into <hint_buf>. Returns the number of bytes written to <hint_buf>.
+ */
+static int cache_extract_hints(struct shared_context *shctx,
+                               struct shared_block *first,
+                               struct buffer *hint_buf)
+{
+	unsigned int offset = sizeof(struct cache_entry);
+	char value_buf[CACHE_MAX_HINT_LINK_VAL];
+
+	while (offset + sizeof(uint32_t) <= first->len) {
+		uint32_t info;
+		enum htx_blk_type type;
+		size_t name_len, value_len;
+
+		if (shctx_row_data_get(shctx, first, (unsigned char *)&info,
+		                       offset, sizeof(info)) != 0)
+			break;
+		type = __htx_blkinfo_type(info);
+		if (type == HTX_BLK_EOH)
+			break;
+		if (type != HTX_BLK_HDR) {
+			offset += sizeof(info) + (info & 0xfffffff);
+			continue;
+		}
+
+		name_len  = info & 0xff;
+		value_len = (info >> 8) & 0xfffff;
+		if (offset + sizeof(info) + name_len + value_len > first->len)
+			break;
+		/* value_buf linearizes the value out of the row; the HTX
+		 * extractor reads it in place and needs no such cap.
+		 */
+		if (value_len <= sizeof(value_buf) && name_len == 4) {
+			char name[4];
+
+			shctx_row_data_get(shctx, first, (unsigned char *)name,
+			                   offset + sizeof(info), 4);
+			if (memcmp(name, "link", 4) == 0) {
+				struct ist value;
+
+				shctx_row_data_get(shctx, first,
+				                   (unsigned char *)value_buf,
+				                   offset + sizeof(info) + name_len,
+				                   value_len);
+
+				value = ist2(value_buf, value_len);
+				cache_extract_link_hints(value, hint_buf);
+			}
+		}
+		offset += sizeof(info) + name_len + value_len;
+	}
+
+	return b_data(hint_buf);
+}
+
+/*
+ * Walk a live HTX response's headers and accumulate Link values relevant
+ * for early hints into <hint_buf>. Returns the number of bytes written
+ * to <hint_buf>. Used by the hints-only storage path, where hints have
+ * to be extracted before the response is committed to the cache.
+ */
+static int cache_extract_hints_from_htx(struct htx *htx, struct buffer *hint_buf)
+{
+	int32_t pos;
+
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		struct htx_blk *blk = htx_get_blk(htx, pos);
+		enum htx_blk_type type = htx_get_blk_type(blk);
+
+		if (type == HTX_BLK_EOH)
+			break;
+		if (type == HTX_BLK_HDR) {
+			struct ist name = htx_get_blk_name(htx, blk);
+			if (isteq(name, ist("link"))) {
+				struct ist value = htx_get_blk_value(htx, blk);
+				cache_extract_link_hints(value, hint_buf);
+			}
+		}
+	}
+
+	return b_data(hint_buf);
+}
+
+/*
+ * Strip a full cache entry in place: persist <hint_buf>'s content past
+ * sizeof(cache_entry), truncate the row to match, mark the entry as
+ * CACHE_EF_STRIPPED, and move it to the hints LRU. Must be called under
+ * the shctx wrlock and with the row's refcount at 0.
+ *
+ * The extracted hint records may end up larger than the original entry
+ * (each value is re-joined with ", " and carries a length prefix), so the
+ * stripped layout is not guaranteed to be smaller. Only strip when it frees
+ * at least one block: this makes room, keeps the copy below within the row,
+ * and guarantees forward progress for the make_room() caller. Returns 1 if
+ * the entry was stripped, 0 if it was left untouched.
+ */
+static int cache_strip_entry(struct shared_context *shctx,
+                             struct cache_entry *entry,
+                             const struct buffer *hint_buf)
+{
+	struct cache *cache = (struct cache *)shctx->data;
+	struct shared_block *first = block_ptr(entry);
+	struct shared_block *block = first;
+	const char *src = b_head(hint_buf);
+	unsigned int new_len = sizeof(struct cache_entry) + b_data(hint_buf);
+	unsigned int off = sizeof(struct cache_entry);
+	unsigned int left = b_data(hint_buf);
+
+	if ((new_len + shctx->block_size - 1) / shctx->block_size >= first->block_count)
+		return 0;
+
+	while (off >= shctx->block_size) {
+		block = LIST_NEXT(&block->list, struct shared_block *, list);
+		off -= shctx->block_size;
+	}
+
+	while (left > 0) {
+		unsigned int chunk = shctx->block_size - off;
+
+		if (chunk > left)
+			chunk = left;
+		memcpy(block->data + off, src, chunk);
+		src += chunk;
+		left -= chunk;
+		off = 0;
+		block = LIST_NEXT(&block->list, struct shared_block *, list);
+	}
+
+	shctx_row_truncate(shctx, first, new_len);
+	entry->flags |= CACHE_EF_STRIPPED;
+	LIST_DELETE(&entry->lru);
+	LIST_APPEND(&cache->hints_lru, &entry->lru);
+	cache->hints_blocks += first->block_count;
+	return 1;
+}
+
+/*
+ * Free one entry's blocks. If the hints pool is at or above the limit
+ * (as defined by early_hints_ratio), first try to evict the oldest hints
+ * entry. Otherwise, pop the oldest full entry and try to strip it. If the
+ * entry doesn't contain the relevant Link headers, or if we are past the
+ * limit for hints blocks, evict it entirely.
+ * Returns 1 on success, 0 if nothing could be freed.
+ */
+static int cache_make_room(struct shared_context *shctx)
+{
+	struct cache *cache = (struct cache *)shctx->data;
+	struct cache_entry *entry, *back;
+	int can_strip = (cache->hints_blocks < CACHE_HINTS_CAP(cache));
+
+	if (!can_strip) {
+		list_for_each_entry_safe(entry, back, &cache->hints_lru, lru) {
+			struct shared_block *first = block_ptr(entry);
+
+			if (first->refcount == 0) {
+				shctx_row_truncate(shctx, first, 0);
+				return 1;
+			}
+		}
+	}
+
+	list_for_each_entry_safe(entry, back, &cache->full_lru, lru) {
+		struct shared_block *first = block_ptr(entry);
+		struct buffer *hint_buf = NULL;
+		int hint_len = 0;
+
+		if (first->refcount > 0)
+			continue;
+
+		/* A key of 0 means the entry is no longer in the tree; its
+		 * blocks are dead and can be reclaimed right away.
+		 */
+		if (!entry->eb.key) {
+			shctx_row_truncate(shctx, first, 0);
+			return 1;
+		}
+
+		if (can_strip) {
+			hint_buf = get_trash_chunk();
+			hint_len = cache_extract_hints(shctx, first, hint_buf);
+		}
+
+		/* Strip the entry to keep its hints; fall back to evicting it
+		 * whole if it has no hints or stripping would free no block.
+		 */
+		if (hint_len <= 0 || !cache_strip_entry(shctx, entry, hint_buf))
+			shctx_row_truncate(shctx, first, 0);
+
+		return 1;
+	}
+
+	return 0;
 }
 
 static void cache_reserve_finish(struct shared_context *shctx)
@@ -1275,8 +1644,9 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	htx = htxbuf(&s->res.buf);
 
 	/* Do not cache too big objects. */
-	if ((msg->flags & HTTP_MSGF_CNT_LEN) && shctx->max_obj_size > 0 &&
-	    s->scb->sedesc->kip > shctx->max_obj_size)
+	if ((msg->flags & HTTP_MSGF_CNT_LEN) &&
+	    !(cache->flags & CACHE_CF_EARLY_HINTS_ONLY) &&
+	    shctx->max_obj_size > 0 && s->scb->sedesc->kip > shctx->max_obj_size)
 		goto out;
 
 	/* Only a subset of headers are supported in our Vary implementation. If
@@ -1284,7 +1654,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 * able to use the cache. Likewise, if Vary header support is disabled,
 	 * avoid caching responses that contain such a header. */
 	ctx.blk = NULL;
-	if (cache->vary_processing_enabled) {
+	if (cache->flags & CACHE_CF_VARY_PROCESSING) {
 		if (!http_check_vary_header(htx, &vary_signature))
 			goto out;
 		if (vary_signature) {
@@ -1311,7 +1681,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 			old = get_secondary_entry(cache_tree, old,
 			                          txn->cache_hash, txn->cache_secondary_hash, 1);
 		if (old) {
-			if (!old->complete) {
+			if (!(old->flags & CACHE_EF_COMPLETE)) {
 				/* An entry with the same primary key is already being
 				 * created, we should not try to store the current
 				 * response because it will waste space in the cache. */
@@ -1333,6 +1703,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 */
 	object = (struct cache_entry *)first->data;
 	memset(object, 0, sizeof(*object));
+	LIST_INIT(&object->lru);
 	object->eb.key = key;
 	object->secondary_key_signature = vary_signature;
 	/* We need to temporarily set a valid expiring time until the actual one
@@ -1377,7 +1748,12 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 		}
 		else
 			goto out;
-		http_remove_header(htx, &ctx);
+		/* The cache serves its copies with a freshly computed Age, so
+		 * the stored response's Age is stripped. In hints-only mode the
+		 * response is only passed through, never served, so leave it.
+		 */
+		if (!(cache->flags & CACHE_CF_EARLY_HINTS_ONLY))
+			http_remove_header(htx, &ctx);
 	}
 
 	/* Build a last-modified time that will be stored in the cache_entry and
@@ -1385,33 +1761,41 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	object->last_modified = get_last_modified_time(htx);
 
 	chunk_reset(&trash);
-	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-		struct htx_blk *blk = htx_get_blk(htx, pos);
-		enum htx_blk_type type = htx_get_blk_type(blk);
-		uint32_t sz = htx_get_blksz(blk);
+	if (cache->flags & CACHE_CF_EARLY_HINTS_ONLY) {
+		cache_extract_hints_from_htx(htx, &trash);
+		if (b_data(&trash) == 0)
+			goto out;
+	} else {
+		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+			struct htx_blk *blk = htx_get_blk(htx, pos);
+			enum htx_blk_type type = htx_get_blk_type(blk);
+			uint32_t sz = htx_get_blksz(blk);
 
-		hdrs_len += sizeof(*blk) + sz;
-		chunk_memcat(&trash, (char *)&blk->info, sizeof(blk->info));
-		chunk_memcat(&trash, htx_get_blk_ptr(htx, blk), sz);
+			hdrs_len += sizeof(*blk) + sz;
+			chunk_memcat(&trash, (char *)&blk->info, sizeof(blk->info));
+			chunk_memcat(&trash, htx_get_blk_ptr(htx, blk), sz);
 
-		/* Look for optional ETag header.
-		 * We need to store the offset of the ETag value in order for
-		 * future conditional requests to be able to perform ETag
-		 * comparisons. */
-		if (type == HTX_BLK_HDR) {
-			struct ist header_name = htx_get_blk_name(htx, blk);
-			if (isteq(header_name, ist("etag"))) {
-				object->etag_length = sz - istlen(header_name);
-				object->etag_offset = sizeof(struct cache_entry) + b_data(&trash) - sz + istlen(header_name);
+			/* Look for optional ETag header.
+			 * We need to store the offset of the ETag value in order for
+			 * future conditional requests to be able to perform ETag
+			 * comparisons. */
+			if (type == HTX_BLK_HDR) {
+				struct ist header_name = htx_get_blk_name(htx, blk);
+				if (isteq(header_name, ist("etag"))) {
+					object->etag_length = sz - istlen(header_name);
+					object->etag_offset = sizeof(struct cache_entry) +
+					                      b_data(&trash) - sz +
+					                      istlen(header_name);
+				}
 			}
+			if (type == HTX_BLK_EOH)
+				break;
 		}
-		if (type == HTX_BLK_EOH)
-			break;
-	}
 
-	/* Do not cache objects if the headers are too big. */
-	if (hdrs_len > htx->size - global.tune.maxrewrite)
-		goto out;
+		/* Do not cache objects if the headers are too big. */
+		if (hdrs_len > htx->size - global.tune.maxrewrite)
+			goto out;
+	}
 
 	/* If the response has a secondary_key, fill its key part related to
 	 * encodings with the actual encoding of the response. This way any
@@ -1419,7 +1803,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 * encodings tested upon the cached response's one.
 	 * We will not cache a response that has an unknown encoding (not
 	 * explicitly supported in parse_encoding_value function). */
-	if (cache->vary_processing_enabled && vary_signature)
+	if ((cache->flags & CACHE_CF_VARY_PROCESSING) && vary_signature)
 		if (set_secondary_key_encoding(htx, vary_signature, object->secondary_key))
 		    goto out;
 
@@ -1437,13 +1821,24 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (shctx_row_data_append(shctx, first, (unsigned char *)trash.area, trash.data) < 0)
 		goto out;
 
+	/* store latest value and expiration time */
+	object->latest_validation = date.tv_sec;
+	object->expire = date.tv_sec + effective_maxage;
+
+	if (cache->flags & CACHE_CF_EARLY_HINTS_ONLY) {
+		/* Finalize hints-only entry. */
+		shctx_wrlock(shctx);
+		object->flags |= CACHE_EF_COMPLETE | CACHE_EF_STRIPPED;
+		cache->hints_blocks += first->block_count;
+		cache_row_reattach(cache, first);
+		shctx_wrunlock(shctx);
+		return ACT_RET_CONT;
+	}
+
 	/* register the buffer in the filter ctx for filling it with data*/
 	if (cache_ctx) {
 		cache_ctx->first_block = first;
 		LIST_INIT(&cache_ctx->detached_head);
-		/* store latest value and expiration time */
-		object->latest_validation = date.tv_sec;
-		object->expire = date.tv_sec + effective_maxage;
 		return ACT_RET_CONT;
 	}
 
@@ -1455,7 +1850,7 @@ out:
 			release_entry_unlocked(cache_tree, object);
 		}
 		shctx_wrlock(shctx);
-		shctx_row_reattach(shctx, first);
+		cache_row_reattach(cache, first);
 		shctx_wrunlock(shctx);
 	}
 
@@ -1478,7 +1873,7 @@ static void http_cache_applet_release(struct appctx *appctx)
 	release_entry(ctx->cache_tree, cache_ptr, 1);
 
 	shctx_wrlock(shctx);
-	shctx_row_reattach(shctx, first);
+	cache_row_reattach(ctx->cache, first);
 	shctx_wrunlock(shctx);
 }
 
@@ -2108,6 +2503,48 @@ static int should_send_notmodified_response(struct cache *cache, struct htx *htx
 	return retval;
 }
 
+/*
+ * Emit an HTTP 103 Early Hints response built from the cached <hint_data> of
+ * length <hint_data_len>. The format matches what http_action_store_cache
+ * writes: concatenated records of {uint16_t length, char value[length]}, each
+ * value being a Link header value. Skipped for HTTP/1.0 clients.
+ * Returns 1 if a 103 response was emitted, 0 otherwise.
+ */
+static int cache_emit_early_hints(struct stream *s, const char *hint_data,
+                                  unsigned int hint_data_len)
+{
+	struct htx *htx;
+	const char *p = hint_data;
+	const char *end = hint_data + hint_data_len;
+
+	if (!(s->txn.http->req.flags & HTTP_MSGF_VER_11))
+		return 0;
+
+	htx = http_early_hint_start(s);
+	if (!htx)
+		goto error;
+
+	while (p + sizeof(uint16_t) <= end) {
+		uint16_t vlen = read_u16(p);
+
+		p += sizeof(vlen);
+		if (p + vlen > end)
+			break;
+		if (!htx_add_header(htx, ist("link"), ist2(p, vlen)))
+			goto error;
+		p += vlen;
+	}
+
+	if (!http_early_hint_end(s))
+		goto error;
+	return 1;
+
+  error:
+	channel_htx_truncate(&s->res, htxbuf(&s->res.buf));
+	s->txn.http->status = 0;
+	return 0;
+}
+
 enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *px,
                                          struct session *sess, struct stream *s, int flags)
 {
@@ -2118,6 +2555,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	struct cache *cache = cconf->c.cache;
 	struct shared_context *shctx = shctx_ptr(cache);
 	struct shared_block *entry_block;
+	struct buffer *hint_buf = NULL;
 
 	struct cache_tree *cache_tree = NULL;
 
@@ -2167,15 +2605,67 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 		entry_block = block_ptr(res);
 		shctx_wrlock(shctx);
-		if (res->complete) {
+		if (res->expire > date.tv_sec &&
+		    (res->flags & CACHE_EF_COMPLETE) && !(res->flags & CACHE_EF_STRIPPED)) {
 			shctx_row_detach(shctx, entry_block);
 			detached = 1;
 		} else {
+			/* p[1] holds the "no-early-hints" opt-out set by parse_cache_use(). */
+			if ((cache->flags & CACHE_CF_EARLY_HINTS) && !rule->arg.act.p[1] &&
+			    (res->flags & (CACHE_EF_STRIPPED | CACHE_EF_COMPLETE))) {
+				/* The emitted hints are best-effort and may not exactly
+				 * match the response finally served: with Vary they may
+				 * come from a different variant (resolved below), and a
+				 * stripped entry keeps emitting after expiry until it is
+				 * re-cached or evicted. This only affects which resources
+				 * are preloaded, never the response itself, so it is
+				 * accepted here.
+				 *
+				 * The trash chunk in hint_buf is consumed only after the
+				 * unlocks below. As get_trash_chunk() rotates between two
+				 * buffers, reusing it more than once before then would
+				 * cycle back onto hint_buf and clobber it.
+				 */
+				hint_buf = get_trash_chunk();
+				if (res->flags & CACHE_EF_STRIPPED) {
+					unsigned int len =
+						entry_block->len - sizeof(struct cache_entry);
+
+					if (len > 0 && len <= b_size(hint_buf) &&
+					    shctx_row_data_get(shctx, entry_block,
+					                       (unsigned char *)b_orig(hint_buf),
+					                       sizeof(struct cache_entry),
+					                       len) == 0)
+						hint_buf->data = len;
+
+					/* Refresh this entry's position in the hints LRU. */
+					LIST_DELETE(&res->lru);
+					LIST_APPEND(&cache->hints_lru, &res->lru);
+				} else {
+					/* CACHE_EF_COMPLETE */
+					cache_extract_hints(shctx, entry_block, hint_buf);
+					if (b_data(hint_buf) > 0 && entry_block->refcount == 0 &&
+					    cache->hints_blocks < CACHE_HINTS_CAP(cache))
+						cache_strip_entry(shctx, res, hint_buf);
+				}
+			}
 			release_entry(cache_tree, res, 0);
 			res = NULL;
 		}
 		shctx_wrunlock(shctx);
 		cache_rdunlock(cache_tree);
+
+		if (hint_buf && b_data(hint_buf) > 0 &&
+		    cache_emit_early_hints(s, b_orig(hint_buf), b_data(hint_buf))) {
+			if (px == strm_fe(s)) {
+				if (px->fe_counters.shared.tg)
+					_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_hint_hits);
+			}
+			else {
+				if (px->be_counters.shared.tg)
+					_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_hint_hits);
+			}
+		}
 
 		/* In case of Vary, we could have multiple entries with the same
 		 * primary hash. We need to calculate the secondary hash in order
@@ -2194,7 +2684,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 					release_entry(cache_tree, res, 0);
 					shctx_wrlock(shctx);
 					if (detached)
-						shctx_row_reattach(shctx, entry_block);
+						cache_row_reattach(cache, entry_block);
 					shctx_wrunlock(shctx);
 				}
 				else if (sec_entry != res) {
@@ -2203,7 +2693,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 					retain_entry(sec_entry);
 					shctx_wrlock(shctx);
 					if (detached)
-						shctx_row_reattach(shctx, entry_block);
+						cache_row_reattach(cache, entry_block);
 					entry_block = block_ptr(sec_entry);
 					shctx_row_detach(shctx, entry_block);
 					shctx_wrunlock(shctx);
@@ -2216,7 +2706,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 				res = NULL;
 				shctx_wrlock(shctx);
-				shctx_row_reattach(shctx, entry_block);
+				cache_row_reattach(cache, entry_block);
 				shctx_wrunlock(shctx);
 			}
 		}
@@ -2227,8 +2717,11 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 		 * the server. */
 		if (!res) {
 			return ACT_RET_CONT;
-		} else if (!res->complete) {
+		} else if (!(res->flags & CACHE_EF_COMPLETE) || (res->flags & CACHE_EF_STRIPPED)) {
 			release_entry(cache_tree, res, 1);
+			shctx_wrlock(shctx);
+			cache_row_reattach(cache, entry_block);
+			shctx_wrunlock(shctx);
 			return ACT_RET_CONT;
 		}
 
@@ -2258,7 +2751,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 			s->target = NULL;
 			release_entry(cache_tree, res, 1);
 			shctx_wrlock(shctx);
-			shctx_row_reattach(shctx, entry_block);
+			cache_row_reattach(cache, entry_block);
 			shctx_wrunlock(shctx);
 			return ACT_RET_CONT;
 		}
@@ -2267,7 +2760,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 	/* Shared context does not need to be locked while we calculate the
 	 * secondary hash. */
-	if (!res && cache->vary_processing_enabled) {
+	if (!res && (cache->flags & CACHE_CF_VARY_PROCESSING)) {
 		/* Build a complete secondary hash until the server response
 		 * tells us which fields should be kept (if any). */
 		http_request_prebuild_full_secondary_key(s);
@@ -2286,6 +2779,14 @@ enum act_parse_ret parse_cache_use(const char **args, int *orig_arg, struct prox
 		return ACT_RET_PRS_ERR;
 
 	(*orig_arg)++;
+
+	/* Stash the "no-early-hints" opt-out in p[1], read back by
+	 * http_action_req_cache_use() to skip 103 emission. */
+	if (*args[*orig_arg] && strcmp(args[*orig_arg], "no-early-hints") == 0) {
+		rule->arg.act.p[1] = (void *)(uintptr_t)1;
+		(*orig_arg)++;
+	}
+
 	return ACT_RET_PRS_OK;
 }
 
@@ -2336,6 +2837,7 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			tmp_cache_config->maxage = 60;
 			tmp_cache_config->maxblocks = 0;
 			tmp_cache_config->maxobjsz = 0;
+			tmp_cache_config->early_hints_ratio = 25;
 			tmp_cache_config->max_secondary_entries = DEFAULT_MAX_SECONDARY_ENTRY;
 		}
 	} else if (strcmp(args[0], "total-max-size") == 0) {
@@ -2413,13 +2915,57 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_WARN;
 		}
 		if (strcmp(args[1], "on") == 0)
-			tmp_cache_config->vary_processing_enabled = 1;
+			tmp_cache_config->flags |= CACHE_CF_VARY_PROCESSING;
 		else if (strcmp(args[1], "off") == 0)
-			tmp_cache_config->vary_processing_enabled = 0;
+			tmp_cache_config->flags &= ~CACHE_CF_VARY_PROCESSING;
 		else {
 			ha_warning("parsing [%s:%d]: '%s' expects \"on\" or \"off\" (enable or disable vary processing).\n",
 				   file, linenum, args[0]);
 			err_code |= ERR_WARN;
+		}
+	} else if (strcmp(args[0], "early-hints") == 0) {
+		if (alertif_too_many_args(3, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		if (strcmp(args[1], "on") == 0) {
+			tmp_cache_config->flags |= CACHE_CF_EARLY_HINTS;
+			tmp_cache_config->flags &= ~CACHE_CF_EARLY_HINTS_ONLY;
+		} else if (strcmp(args[1], "off") == 0) {
+			tmp_cache_config->flags &= ~(CACHE_CF_EARLY_HINTS | CACHE_CF_EARLY_HINTS_ONLY);
+		} else if (strcmp(args[1], "only") == 0) {
+			tmp_cache_config->flags |= CACHE_CF_EARLY_HINTS | CACHE_CF_EARLY_HINTS_ONLY;
+		} else {
+			ha_warning("parsing [%s:%d]: '%s' expects \"on\", \"off\" or \"only\" (enable or disable HTTP 103 Early Hints support, or store only hints).\n",
+				   file, linenum, args[0]);
+			err_code |= ERR_WARN;
+		}
+
+		if (*args[2]) {
+			char *err;
+			unsigned int ratio;
+
+			if (strcmp(args[2], "ratio") != 0) {
+				ha_alert("parsing [%s:%d]: '%s' unexpected argument '%s', expected 'ratio'.\n",
+					 file, linenum, args[0], args[2]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			if (!*args[3]) {
+				ha_alert("parsing [%s:%d]: '%s ratio' expects an integer argument between 1 and 99.\n",
+					 file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			ratio = strtoul(args[3], &err, 10);
+			if (err == args[3] || *err != '\0' || ratio < 1 || ratio > 99) {
+				ha_alert("parsing [%s:%d]: '%s ratio' expects an integer argument between 1 and 99, got '%s'.\n",
+					 file, linenum, args[0], args[3]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			tmp_cache_config->early_hints_ratio = ratio;
 		}
 	} else if (strcmp(args[0], "max-secondary-entries") == 0) {
 		unsigned int max_sec_entries;
@@ -2517,6 +3063,7 @@ int post_check_cache()
 		}
 		shctx->free_block = cache_free_blocks;
 		shctx->reserve_finish = cache_reserve_finish;
+		shctx->make_room = cache_make_room;
 		shctx->cb_data = (void*)shctx->data;
 		/* the cache structure is stored in the shctx and added to the
 		 * caches list, we can remove the entry from the caches_config
@@ -2526,6 +3073,9 @@ int post_check_cache()
 		LIST_APPEND(&caches, &cache->list);
 		LIST_DELETE(&cache_config->list);
 		free(cache_config);
+		LIST_INIT(&cache->full_lru);
+		LIST_INIT(&cache->hints_lru);
+		cache->hints_blocks = 0;
 		for (i = 0; i < CACHE_TREE_NUM; ++i) {
 			cache->trees[i].entries = EB_ROOT;
 			HA_RWLOCK_INIT(&cache->trees[i].lock);
@@ -3058,7 +3608,8 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 					chunk_printf(buf, "%p hash:%u vary:0x", entry, read_u32(entry->hash));
 					for (i = 0; i < HTTP_CACHE_SEC_KEY_LEN; ++i)
 						chunk_appendf(buf, "%02x", (unsigned char)entry->secondary_key[i]);
-					chunk_appendf(buf, " size:%u (%u blocks), refcount:%u, expire:%d\n",
+					chunk_appendf(buf, " type:%s size:%u (%u blocks), refcount:%u, expire:%d\n",
+						      (entry->flags & CACHE_EF_STRIPPED) ? "hints" : "full",
 						      block_ptr(entry)->len, block_ptr(entry)->block_count,
 						      block_ptr(entry)->refcount, entry->expire - (int)date.tv_sec);
 				}

@@ -74,6 +74,7 @@
 #include <haproxy/shctx.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_crtlist.h>
+#include <haproxy/fips.h>
 #include <haproxy/ssl_gencert.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
@@ -3111,7 +3112,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_store *store
 		else
 			memprintf(err, "%s '%s' has an OCSP auto-update set to 'on' but an error occurred (maybe the OCSP URI or the issuer could not be found)'.\n",
 				  err && *err ? *err : "", path);
-		errcode |= ERR_ALERT | ERR_FATAL;
+		errcode |= ERR_WARN;
 		goto end;
 	}
 #endif
@@ -4042,6 +4043,11 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 	min = conf_ssl_methods->min;
 	max = conf_ssl_methods->max;
 
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr += !!ssl_fips_check_version(min,
+	                                   &LIST_ELEM(bind_conf->listeners.n, struct listener *, by_bind)->obj_type);
+#endif
+
 	/* default minimum is TLSV12,  */
 	if (!min) {
 		if (!max || (max >= default_min_ver)) {
@@ -4724,6 +4730,15 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 		          err && *err ? *err : "", curproxy->id, conf_ciphersuites, bind_conf->arg, bind_conf->file, bind_conf->line);
 		cfgerr |= ERR_ALERT | ERR_FATAL;
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr |= ssl_fips_check_ciphersuites(conf_ciphersuites,
+	                                      &LIST_ELEM(bind_conf->listeners.n, struct listener *, by_bind)->obj_type, err);
+#endif
+#endif
+
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr |= ssl_fips_check_ciphers(ctx,
+	                                 &LIST_ELEM(bind_conf->listeners.n, struct listener *, by_bind)->obj_type, err);
 #endif
 
 #ifndef OPENSSL_NO_DH
@@ -4773,6 +4788,10 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 		}
 		(void)SSL_CTX_set_ecdh_auto(ctx, 1);
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr |= ssl_fips_check_curves(conf_curves,
+	                                &LIST_ELEM(bind_conf->listeners.n, struct listener *, by_bind)->obj_type, err);
+#endif
 #endif /* defined(SSL_CTX_set1_curves_list) */
 
 	if (!conf_curves) {
@@ -4820,6 +4839,10 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 			cfgerr |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr |= ssl_fips_check_sigalgs(conf_sigalgs,
+	                                 &LIST_ELEM(bind_conf->listeners.n, struct listener *, by_bind)->obj_type, err);
+#endif
 #endif
 
 #if defined(SSL_CTX_set1_client_sigalgs_list)
@@ -4831,6 +4854,10 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 			cfgerr |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr |= ssl_fips_check_sigalgs(conf_client_sigalgs,
+	                                 &LIST_ELEM(bind_conf->listeners.n, struct listener *, by_bind)->obj_type, err);
+#endif
 #endif
 
 #ifdef USE_QUIC_OPENSSL_COMPAT
@@ -5105,6 +5132,9 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 #if defined(SSL_CTX_set1_curves_list)
 	const char *conf_curves = NULL;
 #endif
+#if defined(OPENSSL_IS_AWSLC)
+	char *err = NULL;
+#endif
 	X509_STORE *store = SSL_CTX_get_cert_store(ctx);
 
 	/* QUIC supports only TLS 1.3. Skip these TLS versions settings. */
@@ -5116,6 +5146,10 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 			   "Use only 'ssl-min-ver' and 'ssl-max-ver' to fix.\n");
 	else
 		flags = conf_ssl_methods->flags;
+
+#if defined(OPENSSL_IS_AWSLC)
+	cfgerr += !!ssl_fips_check_version(conf_ssl_methods->min, &srv->obj_type);
+#endif
 
 	/* Real min and max should be determinate with configuration and openssl's capabilities */
 	if (conf_ssl_methods->min)
@@ -5264,6 +5298,21 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 			 srv->ssl_ctx.ciphersuites);
 		cfgerr++;
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	if (ssl_fips_check_ciphersuites(srv->ssl_ctx.ciphersuites, &srv->obj_type, &err)) {
+		ha_alert("%s", err);
+		ha_free(&err);
+		cfgerr++;
+	}
+#endif
+#endif
+
+#if defined(OPENSSL_IS_AWSLC)
+	if (ssl_fips_check_ciphers(ctx, &srv->obj_type, &err)) {
+		ha_alert("%s", err);
+		ha_free(&err);
+		cfgerr++;
+	}
 #endif
 #if defined(OPENSSL_NPN_NEGOTIATED) && !defined(OPENSSL_NO_NEXTPROTONEG)
 	if (srv->ssl_ctx.npn_str)
@@ -5283,6 +5332,13 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 			cfgerr++;
 		}
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	if (ssl_fips_check_sigalgs(conf_sigalgs, &srv->obj_type, &err)) {
+		ha_alert("%s", err);
+		ha_free(&err);
+		cfgerr++;
+	}
+#endif
 #endif
 #if defined(SSL_CTX_set1_client_sigalgs_list)
 	conf_client_sigalgs = srv->ssl_ctx.client_sigalgs;
@@ -5293,6 +5349,13 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 			cfgerr++;
 		}
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	if (ssl_fips_check_sigalgs(conf_client_sigalgs, &srv->obj_type, &err)) {
+		ha_alert("%s", err);
+		ha_free(&err);
+		cfgerr++;
+	}
+#endif
 #endif
 
 #if defined(SSL_CTX_set1_curves_list)
@@ -5304,6 +5367,13 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 			cfgerr++;
 		}
 	}
+#if defined(OPENSSL_IS_AWSLC)
+	if (ssl_fips_check_curves(conf_curves, &srv->obj_type, &err)) {
+		ha_alert("%s", err);
+		ha_free(&err);
+		cfgerr++;
+	}
+#endif
 #endif /* defined(SSL_CTX_set1_curves_list) */
 
 	return cfgerr;
@@ -6037,7 +6107,7 @@ void ssl_sock_handle_hs_error(struct connection *conn)
  */
 static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 {
-	struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
+	struct ssl_sock_ctx *ctx;
 	int ret;
 	struct ssl_counters *counters = NULL;
 	struct ssl_counters *counters_px = NULL;
@@ -6049,6 +6119,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 	if (!conn_ctrl_ready(conn))
 		return 0;
 
+	ctx = conn_get_ssl_sock_ctx(conn);
 	if (!ctx)
 		goto out_error;
 
@@ -8492,6 +8563,37 @@ static void __ssl_sock_init(void)
 	if (global_ssl.connect_default_ciphersuites)
 		global_ssl.connect_default_ciphersuites = strdup(global_ssl.connect_default_ciphersuites);
 #endif
+
+#if defined(OPENSSL_IS_AWSLC)
+	/* When AWS-LC is built in FIPS mode, override any compile-time cipher
+	 * defaults with the FIPS-approved sets. This runs before the config
+	 * parser so that explicit ssl-default-{bind,server}-ciphers{suites}
+	 * keywords in the global section still take precedence. */
+	if (FIPS_mode()) {
+		free(global_ssl.listen_default_ciphers);
+		global_ssl.listen_default_ciphers = strdup(LISTEN_DEFAULT_FIPS_CIPHERS);
+		free(global_ssl.connect_default_ciphers);
+		global_ssl.connect_default_ciphers = strdup(CONNECT_DEFAULT_FIPS_CIPHERS);
+		free(global_ssl.listen_default_ciphersuites);
+		global_ssl.listen_default_ciphersuites = strdup(LISTEN_DEFAULT_FIPS_CIPHERSUITES);
+		free(global_ssl.connect_default_ciphersuites);
+		global_ssl.connect_default_ciphersuites = strdup(CONNECT_DEFAULT_FIPS_CIPHERSUITES);
+		free(global_ssl.listen_default_curves);
+		global_ssl.listen_default_curves = strdup(LISTEN_DEFAULT_FIPS_CURVES);
+		free(global_ssl.connect_default_curves);
+		global_ssl.connect_default_curves = strdup(CONNECT_DEFAULT_FIPS_CURVES);
+#if defined(SSL_CTX_set1_sigalgs_list)
+		free(global_ssl.listen_default_sigalgs);
+		global_ssl.listen_default_sigalgs = strdup(LISTEN_DEFAULT_FIPS_SIGALGS);
+		free(global_ssl.connect_default_sigalgs);
+		global_ssl.connect_default_sigalgs = strdup(CONNECT_DEFAULT_FIPS_SIGALGS);
+		free(global_ssl.listen_default_client_sigalgs);
+		global_ssl.listen_default_client_sigalgs = strdup(LISTEN_DEFAULT_FIPS_CLIENT_SIGALGS);
+		free(global_ssl.connect_default_client_sigalgs);
+		global_ssl.connect_default_client_sigalgs = strdup(CONNECT_DEFAULT_FIPS_CLIENT_SIGALGS);
+#endif
+	}
+#endif /* OPENSSL_IS_AWSLC */
 
 	xprt_register(XPRT_SSL, &ssl_sock);
 #if HA_OPENSSL_VERSION_NUMBER < 0x10100000L

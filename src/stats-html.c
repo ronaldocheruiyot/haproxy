@@ -19,6 +19,7 @@
 #include <haproxy/pipe.h>
 #include <haproxy/proxy.h>
 #include <haproxy/stats.h>
+#include <haproxy/stats-proxy.h>
 #include <haproxy/stconn.h>
 #include <haproxy/server.h>
 #include <haproxy/task.h>
@@ -610,6 +611,7 @@ int stats_dump_fields_html(struct buffer *out,
 			              "<tr><th>Intercepted requests:</th><td>%s</td></tr>"
 			              "<tr><th>Cache lookups:</th><td>%s</td></tr>"
 			              "<tr><th>Cache hits:</th><td>%s</td><td>(%d%%)</td></tr>"
+			              "<tr><th>Cache hint hits:</th><td>%s</td></tr>"
 			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
 			              "<tr><th>Internal errors:</th><td>%s</td></tr>"
 			              "",
@@ -618,6 +620,7 @@ int stats_dump_fields_html(struct buffer *out,
 			              U2H(stats[ST_I_PX_CACHE_HITS].u.u64),
 			              stats[ST_I_PX_CACHE_LOOKUPS].u.u64 ?
 			              (int)(100 * stats[ST_I_PX_CACHE_HITS].u.u64 / stats[ST_I_PX_CACHE_LOOKUPS].u.u64) : 0,
+			              U2H(stats[ST_I_PX_CACHE_HINT_HITS].u.u64),
 			              U2H(stats[ST_I_PX_WREW].u.u64),
 			              U2H(stats[ST_I_PX_EINT].u.u64));
 		}
@@ -1215,6 +1218,7 @@ int stats_dump_fields_html(struct buffer *out,
 			              "<tr><th>- other responses:</th><td>%s</td></tr>"
 			              "<tr><th>Cache lookups:</th><td>%s</td></tr>"
 			              "<tr><th>Cache hits:</th><td>%s</td><td>(%d%%)</td></tr>"
+			              "<tr><th>Cache hint hits:</th><td>%s</td></tr>"
 			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
 			              "<tr><th>Internal errors:</th><td>%s</td></tr>"
 				      "",
@@ -1236,6 +1240,7 @@ int stats_dump_fields_html(struct buffer *out,
 			              U2H(stats[ST_I_PX_CACHE_HITS].u.u64),
 			              stats[ST_I_PX_CACHE_LOOKUPS].u.u64 ?
 			              (int)(100 * stats[ST_I_PX_CACHE_HITS].u.u64 / stats[ST_I_PX_CACHE_LOOKUPS].u.u64) : 0,
+			              U2H(stats[ST_I_PX_CACHE_HINT_HITS].u.u64),
 			              U2H(stats[ST_I_PX_WREW].u.u64),
 			              U2H(stats[ST_I_PX_EINT].u.u64));
 		}
@@ -1734,7 +1739,29 @@ static int stats_process_http_post(struct stconn *sc)
 
 			/* Now we can check the key to see what to do */
 			if (!px && (strcmp(key, "b") == 0)) {
-				if ((px = proxy_be_by_name(value)) == NULL) {
+				/* we need to lookup the proxy because its name
+				 * may be a real name ("pub") or numeric ("#4").
+				 */
+				px = proxy_be_by_name(value);
+
+				/* now we have two possibilities:
+				 *   - if the are "stats scope" rules, a non-existing
+				 *     proxy or a forbidden one are the same, we return
+				 *     a deny because a non-existing name cannot match
+				 *     a scope rule and we don't want to disclose the
+				 *     existence of a given name.
+				 *   - without "stats scope" rules, we just return
+				 *     not found.
+				 */
+				if (ctx->http_px->uri_auth && ctx->http_px->uri_auth->scope) {
+					if (!px || !stats_proxy_in_scope(px, ctx->http_px->uri_auth, ctx->http_px)) {
+						/* "stats scope" rules do not permit to access this proxy name */
+						ctx->st_code = STAT_STATUS_DENY;
+						goto out;
+					}
+				}
+
+				if (!px) {
 					/* the backend name is unknown or ambiguous (duplicate names) */
 					ctx->st_code = STAT_STATUS_ERRP;
 					goto out;

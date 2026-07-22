@@ -129,42 +129,61 @@ void tasklet_kill(struct tasklet *t)
 	}
 }
 
+/* Do not call this one, please use tasklet_wakeup_here() instead, as this one
+ * is the slow path of tasklet_wakeup_here() which performs some preliminary
+ * checks and sets TASK_QUEUED before calling this one. It is only permitted to
+ * call this function for tasks/tasklets that are not bound (->tid==-1) or that
+ * are bound to the local thread (->tid==tid || ->tid==-2-tid).
+ */
+void __tasklet_wakeup_here(struct tasklet *tl)
+{
+	BUG_ON_HOT(tl->tid != -1 && tl->tid != tid && tl->tid != -2 - tid);
+
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
+		tl->wake_date = now_mono_time();
+
+	/* this tasklet runs on the caller thread */
+	if (tl->state & TASK_HEAVY) {
+		LIST_APPEND(&th_ctx->tasklets[TL_HEAVY], &tl->list);
+		th_ctx->tl_class_mask |= 1 << TL_HEAVY;
+	}
+	else if (unlikely(tl->state & TASK_RT)) {
+		LIST_APPEND(&th_ctx->tasklets[TL_RT], &tl->list);
+		th_ctx->tl_class_mask |= 1 << TL_RT;
+	}
+	else if (tl->state & TASK_SELF_WAKING) {
+		LIST_APPEND(&th_ctx->tasklets[TL_BULK], &tl->list);
+		th_ctx->tl_class_mask |= 1 << TL_BULK;
+	}
+	else if ((struct task *)tl == th_ctx->current && !(tl->state & TASK_WOKEN_ANY)) {
+		LIST_APPEND(&th_ctx->tasklets[TL_BULK], &tl->list);
+		th_ctx->tl_class_mask |= 1 << TL_BULK;
+	}
+	else if (th_ctx->current_queue < 0) {
+		LIST_APPEND(&th_ctx->tasklets[TL_URGENT], &tl->list);
+		th_ctx->tl_class_mask |= 1 << TL_URGENT;
+	}
+	else {
+		LIST_APPEND(&th_ctx->tasklets[TL_NORMAL], &tl->list);
+		th_ctx->tl_class_mask |= 1 << TL_NORMAL;
+	}
+	_HA_ATOMIC_INC(&th_ctx->rq_total);
+}
+
 /* Do not call this one, please use tasklet_wakeup_on() instead, as this one is
  * the slow path of tasklet_wakeup_on() which performs some preliminary checks
- * and sets TASK_QUEUED before calling this one. A negative <thr> designates
- * the current thread.
+ * and sets TASK_QUEUED before calling this one.
  */
 void __tasklet_wakeup_on(struct tasklet *tl, int thr)
 {
-	if (likely(thr < 0)) {
-		/* this tasklet runs on the caller thread */
-		if (tl->state & TASK_HEAVY) {
-			LIST_APPEND(&th_ctx->tasklets[TL_HEAVY], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_HEAVY;
-		}
-		else if (tl->state & TASK_SELF_WAKING) {
-			LIST_APPEND(&th_ctx->tasklets[TL_BULK], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_BULK;
-		}
-		else if ((struct task *)tl == th_ctx->current && !(tl->state & TASK_WOKEN_ANY)) {
-			LIST_APPEND(&th_ctx->tasklets[TL_BULK], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_BULK;
-		}
-		else if (th_ctx->current_queue < 0) {
-			LIST_APPEND(&th_ctx->tasklets[TL_URGENT], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_URGENT;
-		}
-		else {
-			LIST_APPEND(&th_ctx->tasklets[TL_NORMAL], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_NORMAL;
-		}
-		_HA_ATOMIC_INC(&th_ctx->rq_total);
-	} else {
-		/* this tasklet runs on a specific thread. */
-		MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list, list_to_mt_list(&tl->list));
-		_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
-		wake_thread(thr);
-	}
+	BUG_ON_HOT(thr < 0);
+
+	if (_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_TASK_PROFILING)
+		tl->wake_date = now_mono_time();
+
+	MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list, list_to_mt_list(&tl->list));
+	_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
+	wake_thread(thr);
 }
 
 /* Do not call this one, please use tasklet_wakeup_after_on() instead, as this one is
@@ -174,33 +193,17 @@ void __tasklet_wakeup_on(struct tasklet *tl, int thr)
 struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl)
 {
 	BUG_ON(tl->tid >= 0 && tid != tl->tid);
+
 	/* this tasklet runs on the caller thread */
 	if (!head) {
-		if (tl->state & TASK_HEAVY) {
-			LIST_INSERT(&th_ctx->tasklets[TL_HEAVY], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_HEAVY;
-		}
-		else if (tl->state & TASK_SELF_WAKING) {
-			LIST_INSERT(&th_ctx->tasklets[TL_BULK], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_BULK;
-		}
-		else if ((struct task *)tl == th_ctx->current && !(tl->state & TASK_WOKEN_ANY)) {
-			LIST_INSERT(&th_ctx->tasklets[TL_BULK], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_BULK;
-		}
-		else if (th_ctx->current_queue < 0) {
-			LIST_INSERT(&th_ctx->tasklets[TL_URGENT], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_URGENT;
-		}
-		else {
-			LIST_INSERT(&th_ctx->tasklets[TL_NORMAL], &tl->list);
-			th_ctx->tl_class_mask |= 1 << TL_NORMAL;
-		}
+		__tasklet_wakeup_here(tl);
 	}
 	else {
+		if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
+			tl->wake_date = now_mono_time();
 		LIST_APPEND(head, &tl->list);
+		_HA_ATOMIC_INC(&th_ctx->rq_total);
 	}
-	_HA_ATOMIC_INC(&th_ctx->rq_total);
 	return &tl->list;
 }
 
@@ -222,6 +225,15 @@ void __task_wakeup(struct task *t)
 	int thr __maybe_unused = __task_get_current_owner(t->tid);
 
 	BUG_ON(t->tid == -1);
+
+	if (unlikely(_HA_ATOMIC_LOAD(&t->state) & TASK_RT)) {
+		/* real-time tasks must be super rare; they are woken up as tasklets. */
+		if (thr < 0 || thr == tid)
+			__tasklet_wakeup_here((struct tasklet *)t);
+		else
+			__tasklet_wakeup_on((struct tasklet *)t, thr);
+		return;
+	}
 
 #ifdef USE_THREAD
 	if (thr != tid) {
@@ -380,13 +392,15 @@ void wake_expired_tasks()
 			 * If it's a shared task, see whether we should hand it
 			 * to a less loaded thread.
 			 */
-			if (task->tid < 0) {
+			if (unlikely(task->tid < 0) && global.nbthread > 1) {
 				int attempts = MIN(global.nbthread, 3);
 				while (attempts-- > 0) {
 					uint new_tid = statistical_prng_range(global.nbthread);
 
 					if (new_tid == tid)
 						continue;
+
+					ASSUME(new_tid < MAX_THREADS);
 					if (ha_thread_ctx[new_tid].rq_total * 2 < th_ctx->rq_total) {
 						int cur_state;
 						do {
@@ -491,7 +505,8 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 				 * budget to run them. Let's switch to it now.
 				 */
 				queue = (th_ctx->tl_class_mask & 1) ? 0 :
-					(th_ctx->tl_class_mask & 2) ? 1 : 2;
+					(th_ctx->tl_class_mask & 2) ? 1 :
+					(th_ctx->tl_class_mask & 4) ? 2 : 3;
 				continue;
 			}
 
@@ -703,6 +718,7 @@ void process_runnable_tasks()
 	struct eb32_node *grq; // next global run queue entry
 	struct task *t;
 	const unsigned int default_weights[TL_CLASSES] = {
+		[TL_RT]     = 1,  // never more than 1 RT task at once
 		[TL_URGENT] = 64, // ~50% of CPU bandwidth for I/O
 		[TL_NORMAL] = 60, // ~47% of CPU bandwidth for tasks
 		[TL_BULK]   = 4,  // ~3% of CPU bandwidth for self-wakers
@@ -714,6 +730,7 @@ void process_runnable_tasks()
 	unsigned int queue;
 	int max_processed;
 	int lpicked, gpicked;
+	int rt_queued = 0;
 	int heavy_queued = 0;
 	int budget, done;
 
@@ -740,6 +757,16 @@ void process_runnable_tasks()
 
  not_done_yet:
 	max[TL_URGENT] = max[TL_NORMAL] = max[TL_BULK] = 0;
+
+	/* RT tasklets list may be processed at most once */
+	if (!rt_queued) {
+		if ((tt->tl_class_mask & (1 << TL_RT))) {
+			max[TL_RT] = default_weights[TL_RT];
+			rt_queued = 1;
+		}
+		else
+			max[TL_RT] = 0;
+	}
 
 	/* urgent tasklets list gets a default weight of ~50% */
 	if ((tt->tl_class_mask & (1 << TL_URGENT)) ||
@@ -775,12 +802,16 @@ void process_runnable_tasks()
 	 * a first MT_LIST_ISEMPTY() to succeed for thread_has_task() and the
 	 * one above to finally fail. This is extremely rare and not a problem.
 	 */
-	max_total = max[TL_URGENT] + max[TL_NORMAL] + max[TL_BULK] + max[TL_HEAVY];
+	max_total = max[TL_RT] + max[TL_URGENT] + max[TL_NORMAL] + max[TL_BULK] + max[TL_HEAVY];
 	if (!max_total)
 		goto leave;
 
 	for (queue = 0; queue < TL_CLASSES; queue++)
 		max[queue]  = ((unsigned)max_processed * max[queue] + max_total - 1) / max_total;
+
+	/* The RT queue must never process more than one task at once */
+	if (max[TL_RT] > 1)
+		max[TL_RT] = 1;
 
 	/* The heavy queue must never process more than very few tasks at once
 	 * anyway. We set the limit to 1 if running on low_latency scheduling,
@@ -809,7 +840,7 @@ void process_runnable_tasks()
 	/* Note: the grq lock is always held when grq is not null */
 	lpicked = gpicked = 0;
 	budget = max[TL_NORMAL] - tt->tasks_in_list;
-	while (lpicked + gpicked < budget) {
+	while (lpicked + gpicked < budget && (!rt_queued || !(global.tune.options & GTUNE_SCHED_LOW_LATENCY))) {
 		if (!eb_is_empty(&th_ctx->rqueue_shared) && !grq) {
 #ifdef USE_THREAD
 			HA_SPIN_LOCK(TASK_RQ_LOCK, &th_ctx->rqsh_lock);
@@ -889,7 +920,7 @@ void process_runnable_tasks()
 	max_processed -= done;
 
 	/* some tasks may have woken other ones up */
-	if (done && max_processed > 0 && thread_has_tasks())
+	if (done && max_processed > 0 && !rt_queued && thread_has_tasks())
 		goto not_done_yet;
 
  leave:

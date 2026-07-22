@@ -256,8 +256,15 @@ int cfg_parse_listen_match_option(const char *file, int linenum, int kwm,
 	for (optnum = 0; config_opts[optnum].name; optnum++) {
 		if (strcmp(args[1], config_opts[optnum].name) == 0) {
 			if (config_opts[optnum].cap == PR_CAP_NONE) {
-				ha_alert("parsing [%s:%d]: option '%s' is not supported due to build options.\n",
-					 file, linenum, config_opts[optnum].name);
+				if (config_opts[optnum].val)
+					ha_alert("parsing [%s:%d]: support for option '%s' was removed in version %u.%u.\n",
+					         file, linenum, config_opts[optnum].name,
+					         (config_opts[optnum].val >> 8) & 0xff,
+					         config_opts[optnum].val & 0xff);
+				else
+					ha_alert("parsing [%s:%d]: option '%s' is not supported due to build options.\n",
+					         file, linenum, config_opts[optnum].name);
+
 				*err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
@@ -2429,11 +2436,13 @@ stats_error_parsing:
 			if (err_code & ERR_FATAL)
 				goto out;
 		}
+#if defined(USE_SPOE)
 		else if (strcmp(args[1], "spop-check") == 0) {
 			err_code |= proxy_parse_spop_check_opt(args, 0, curproxy, curr_defproxy, file, linenum);
 			if (err_code & ERR_FATAL)
 				goto out;
 		}
+#endif
 		else if (strcmp(args[1], "tcp-check") == 0) {
 			err_code |= proxy_parse_tcp_check_opt(args, 0, curproxy, curr_defproxy, file, linenum);
 			if (err_code & ERR_FATAL)
@@ -2619,22 +2628,13 @@ stats_error_parsing:
 			goto out;
 		}
 	}
-#ifdef USE_TPROXY
 	else if (strcmp(args[0], "transparent") == 0) {
-		/* enable transparent proxy connections */
-		curproxy->options |= PR_O_TRANSP;
-		if (alertif_too_many_args(0, file, linenum, args, &err_code))
-			goto out;
-		if (!deprecated_directives_allowed) {
-			ha_warning("parsing [%s:%d]: '%s' is deprecated in 3.3 and will be removed in 3.5. "
-			           "The modern way to do the same is to create a server with address 0.0.0.0. It is "
-			           "still possible to silence this warning by setting 'expose-deprecated-directives' "
-			           "in the 'global' section, but do not wait to fix your configuration!\n",
-			           file, linenum, args[0]);
-			err_code |= ERR_WARN;
-		}
+		ha_alert("parsing [%s:%d]: support for '%s' was removed in version 3.5. "
+		         "The modern way to do the same is to create a server with address 0.0.0.0.\n",
+		         file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
 	}
-#endif
 	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */
 		if (warnifnotcap(curproxy, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
 			err_code |= ERR_WARN;
@@ -2681,43 +2681,13 @@ stats_error_parsing:
 		goto out;
 	}
 	else if (strcmp(args[0], "dispatch") == 0) {  /* dispatch address */
-		struct sockaddr_storage *sk;
-		int port1, port2;
-
-		if (curproxy->cap & PR_CAP_DEF) {
-			ha_alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-		else if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
-			err_code |= ERR_WARN;
-
-		sk = str2sa_range(args[1], NULL, &port1, &port2, NULL, NULL, NULL,
-		                  &errmsg, NULL, NULL, NULL,
-		                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
-		if (!sk) {
-			ha_alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], errmsg);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-
-		if (alertif_too_many_args(1, file, linenum, args, &err_code))
-			goto out;
-
-		if (!deprecated_directives_allowed) {
-			ha_warning("parsing [%s:%d]: '%s' is deprecated in 3.3 and will be removed in 3.5. "
-			           "The modern way to do the same is to create a server with the same address, and "
-				   "possibly to assign any extra server a weight of zero if any:\n"
-				   "    server dispatch %s\n"
-				   "Note that it is still possible to silence this warning by setting "
-				   "'expose-deprecated-directives' in the 'global' section, but do not wait to fix "
-				   "your configuration!\n",
-			           file, linenum, args[0], args[1]);
-			err_code |= ERR_WARN;
-		}
-
-		curproxy->dispatch_addr = *sk;
-		curproxy->options |= PR_O_DISPATCH;
+		ha_alert("parsing [%s:%d]: support for '%s' was removed in version 3.5. "
+			 "The modern way to do the same is to create a server with the same address, and "
+			 "possibly to assign any extra server a weight of zero if any:\n"
+			 "    server dispatch %s\n",
+			 file, linenum, args[0], args[1]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
 	}
 	else if (strcmp(args[0], "balance") == 0) {  /* set balancing with optional algorithm */
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))

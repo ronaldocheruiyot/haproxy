@@ -61,6 +61,7 @@
 #include <haproxy/stats.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
+#include <haproxy/stress.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/thread.h>
@@ -82,6 +83,12 @@ unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then
 
 unsigned int dynpx_next_id = 0; /* lowest ID assigned to dynamic proxies */
 
+/* CLI context used during "show backend" */
+struct show_be_ctx {
+	struct proxy *px;
+	struct watcher px_watch; /* watcher to automatically update px pointer on backend deletion */
+};
+
 /* CLI context used during "show servers {state|conn}" */
 struct show_srv_ctx {
 	struct proxy *px;       /* current proxy to dump or NULL */
@@ -92,9 +99,16 @@ struct show_srv_ctx {
 		SHOW_SRV_HEAD = 0,
 		SHOW_SRV_LIST,
 	} state;
+
+	struct watcher px_watch;  /* watcher to automatically update px on backend deletion */
+	struct watcher srv_watch; /* watcher to automatically update sv on server deletion */
 };
 
-/* proxy->options */
+/* proxy->options. For unsupported ones, pass 0 in the "cap" (PR_CAP_*) field.
+ * If this is due to feature removal, the val field can contain the version the
+ * option was removed in the "val" (PR_O_*) field as (major<<8)+minor (e.g.
+ * 0x305 for "3.5"). Pass zero there to indicate build options instead.
+ */
 const struct cfg_opt cfg_opts[] =
 {
 	{ "abortonclose", PR_O_ABRT_CLOSE, PR_CAP_BE|PR_CAP_FE, 0, 0 },
@@ -113,11 +127,7 @@ const struct cfg_opt cfg_opts[] =
 	{ "nolinger",     PR_O_TCP_NOLING, PR_CAP_FE | PR_CAP_BE, 0, 0 },
 	{ "persist",      PR_O_PERSIST,    PR_CAP_BE, 0, 0 },
 	{ "srvtcpka",     PR_O_TCP_SRV_KA, PR_CAP_BE, 0, 0 },
-#ifdef USE_TPROXY
-	{ "transparent",  PR_O_TRANSP,     PR_CAP_BE, 0, 0 },
-#else
-	{ "transparent",  0, 0, 0, 0 },
-#endif
+	{ "transparent",  0x305, 0, 0, 0 },
 
 	{ NULL, 0, 0, 0, 0 }
 };
@@ -1875,32 +1885,14 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	}
 
 	if (px->cap & PR_CAP_BE) {
-		if (px->lbprm.algo & BE_LB_KIND) {
-			if (px->options & PR_O_TRANSP) {
-				ha_alert("%s '%s' cannot use both transparent and balance mode.\n",
-				         proxy_type_str(px), px->id);
-				cfgerr++;
-			}
-			else if (px->options & PR_O_DISPATCH) {
-				ha_warning("dispatch address of %s '%s' will be ignored in balance mode.\n",
-				           proxy_type_str(px), px->id);
-				*err_code |= ERR_WARN;
-			}
-		}
-		else if (!(px->options & (PR_O_TRANSP | PR_O_DISPATCH))) {
-			/* If no LB algo is set in a backend, and we're not in
-			 * transparent mode, dispatch mode nor proxy mode, we
+		if (!(px->lbprm.algo & BE_LB_KIND)) {
+			/* If no LB algo is set in a backend, we
 			 * want to use balance random by default.
 			 */
 			px->lbprm.algo &= ~BE_LB_ALGO;
 			px->lbprm.algo |= BE_LB_ALGO_RND;
 		}
 	}
-
-	if (px->options & PR_O_DISPATCH)
-		px->options &= ~PR_O_TRANSP;
-	else if (px->options & PR_O_TRANSP)
-		px->options &= ~PR_O_DISPATCH;
 
 	if ((px->tcpcheck.flags & TCPCHK_FL_UNUSED_HTTP_RS)) {
 		ha_warning("%s '%s' uses http-check rules without 'option httpchk', so the rules are ignored.\n",
@@ -2137,7 +2129,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 		}
 		ha_free(&srule->srv.name);
 		srule->srv.ptr = target;
-		target->flags |= SRV_F_NON_PURGEABLE;
+		target->flags |= SRV_F_NAME_REFD;
 	}
 
 	/* find the target table for 'stick' rules */
@@ -4457,6 +4449,9 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 
 	ctx->show_conn = *args[2] == 'c'; // "conn" vs "state"
 
+	watcher_init(&ctx->px_watch,  &ctx->px, offsetof(struct proxy,  watcher_list));
+	watcher_init(&ctx->srv_watch, &ctx->sv, offsetof(struct server, watcher_list));
+
 	/* check if a backend name has been provided */
 	if (*args[3]) {
 		/* read server state from local file */
@@ -4465,7 +4460,7 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 		if (!px)
 			return cli_err(appctx, "Can't find backend.\n");
 
-		ctx->px = px;
+		watcher_attach(&ctx->px_watch, px);
 		ctx->only_pxid = px->uuid;
 	}
 	return 0;
@@ -4507,9 +4502,9 @@ static int dump_servers_state(struct appctx *appctx)
 	char *srvrecord;
 
 	if (!ctx->sv)
-		ctx->sv = px->srv;
+		watcher_attach(&ctx->srv_watch, px->srv);
 
-	for (; ctx->sv != NULL; ctx->sv = srv->next) {
+	for (; ctx->sv; watcher_next(&ctx->srv_watch, ctx->sv->next)) {
 		srv = ctx->sv;
 
 		dump_server_addr(&srv->addr, srv_addr);
@@ -4566,7 +4561,8 @@ static int dump_servers_state(struct appctx *appctx)
 			chunk_appendf(&trash, "\n");
 		}
 
-		if (applet_putchk(appctx, &trash) == -1) {
+		if (STRESS_RUN1(applet_putchk_stress(appctx, &trash) == -1,
+		                applet_putchk(appctx, &trash) == -1)) {
 			return 0;
 		}
 	}
@@ -4596,10 +4592,10 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 		ctx->state = SHOW_SRV_LIST;
 
 		if (!ctx->px)
-			ctx->px = proxies_list;
+			watcher_attach(&ctx->px_watch, proxies_list);
 	}
 
-	for (; ctx->px != NULL; ctx->px = curproxy->next) {
+	for (; ctx->px; watcher_next(&ctx->px_watch, ctx->px->next)) {
 		curproxy = ctx->px;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
@@ -4607,8 +4603,10 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 				return 0;
 		}
 		/* only the selected proxy is dumped */
-		if (ctx->only_pxid)
+		if (ctx->only_pxid) {
+			watcher_detach(&ctx->px_watch);
 			break;
+		}
 	}
 
 	return 1;
@@ -4619,28 +4617,33 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
+	struct show_be_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
 
-	if (!appctx->svcctx) {
+	if (!ctx->px) {
 		chunk_printf(&trash, "# name\n");
 		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
 
-		appctx->svcctx = proxies_list;
+		watcher_init(&ctx->px_watch, &ctx->px, offsetof(struct proxy, watcher_list));
+		/* This will automatically update ctx->px pointer. */
+		watcher_attach(&ctx->px_watch, proxies_list);
 	}
 
-	for (; appctx->svcctx != NULL; appctx->svcctx = curproxy->next) {
-		curproxy = appctx->svcctx;
+	for (; ctx->px; watcher_next(&ctx->px_watch, ctx->px->next)) {
+		curproxy = ctx->px;
 
 		/* looking for non-internal backends only */
 		if ((curproxy->cap & (PR_CAP_BE|PR_CAP_INT)) != PR_CAP_BE)
 			continue;
 
 		chunk_appendf(&trash, "%s\n", curproxy->id);
-		if (applet_putchk(appctx, &trash) == -1)
+		if (STRESS_RUN1(applet_putchk_stress(appctx, &trash) == -1,
+		                applet_putchk(appctx, &trash) == -1)) {
 			return 0;
+		}
 	}
 
 	return 1;
@@ -5034,11 +5037,6 @@ int be_check_for_deletion(const char *bename, struct proxy **pb, const char **pm
 
 	if (be->cap & PR_CAP_FE) {
 		msg = "Cannot delete a listen section.";
-		goto out;
-	}
-
-	if (be->options & (PR_O_DISPATCH|PR_O_TRANSP)) {
-		msg = "Deletion of backend with deprecated dispatch/transparent options is not supported.";
 		goto out;
 	}
 

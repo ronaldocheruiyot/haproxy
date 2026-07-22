@@ -60,12 +60,14 @@
 #   USE_WURFL               : enable WURFL detection library from Scientiamobile
 #   USE_OBSOLETE_LINKER     : use when the linker fails to emit __start_init/__stop_init
 #   USE_THREAD_DUMP         : use the more advanced thread state dump system. Automatic.
-#   USE_OT                  : enable the OpenTracing filter
 #   USE_MEMORY_PROFILING    : enable the memory profiler. Linux-glibc only.
 #   USE_LIBATOMIC           : force to link with/without libatomic. Automatic.
 #   USE_PTHREAD_EMULATION   : replace pthread's rwlocks with ours
 #   USE_SHM_OPEN            : use shm_open() for features that can make use of shared memory
 #   USE_KTLS                : use kTLS.(requires at least Linux 4.17).
+#   USE_FCGI                : enable the FCGI subsystem. Always on.
+#   USE_H2                  : enable HTTP/2 subsystem. Always on.
+#   USE_SPOE                : enable the SPOE subsystem. Always on.
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string). The list of enabled and disabled options for a
@@ -125,11 +127,6 @@
 #   LUA_INC        : force the include path to lua
 #   LUA_LIB_NAME   : force the lib name (or automatically evaluated, by order of
 #                    priority: lua5.5, lua55, lua5.4, lua54, lua5.3, lua53, lua).
-#   OT_DEBUG       : compile the OpenTracing filter in debug mode
-#   OT_INC         : force the include path to libopentracing-c-wrapper
-#   OT_LIB         : force the lib path to libopentracing-c-wrapper
-#   OT_RUNPATH     : add RUNPATH for libopentracing-c-wrapper to haproxy executable
-#   OT_USE_VARS    : allows the use of variables for the OpenTracing context
 #   IGNOREGIT      : ignore GIT commit versions if set.
 #   VERSION        : force haproxy version reporting.
 #   SUBVERS        : add a sub-version (eg: platform, model, ...).
@@ -160,7 +157,7 @@ DOCDIR = $(PREFIX)/doc/haproxy
 # following list (use the default "generic" if uncertain) :
 #    linux-glibc, linux-glibc-legacy, linux-musl, solaris, freebsd, freebsd-glibc,
 #    dragonfly, openbsd, netbsd, cygwin, haiku, aix51, aix52, aix72-gcc, osx, generic,
-#    custom
+#    custom, tiny
 TARGET =
 
 #### No longer used
@@ -344,12 +341,12 @@ use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER USE_POLL                        \
            USE_TPROXY USE_LINUX_TPROXY USE_LINUX_CAP                          \
            USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_ENGINE               \
            USE_GETADDRINFO USE_OPENSSL USE_OPENSSL_WOLFSSL USE_OPENSSL_AWSLC  \
-           USE_ECH USE_TRACE                                                  \
+           USE_ECH USE_TRACE USE_FCGI USE_H2 USE_SPOE                         \
            USE_SSL USE_LUA USE_ACCEPT4 USE_CLOSEFROM USE_ZLIB USE_SLZ         \
            USE_CPU_AFFINITY USE_TFO USE_NS USE_DL USE_RT USE_LIBATOMIC        \
            USE_MATH USE_DEVICEATLAS USE_51DEGREES                             \
            USE_WURFL USE_OBSOLETE_LINKER USE_PRCTL USE_PROCCTL                \
-           USE_THREAD_DUMP USE_EVPORTS USE_OT USE_QUIC USE_PROMEX             \
+           USE_THREAD_DUMP USE_EVPORTS USE_QUIC USE_PROMEX                    \
            USE_MEMORY_PROFILING USE_SHM_OPEN                                  \
            USE_STATIC_PCRE USE_STATIC_PCRE2                                   \
            USE_PCRE USE_PCRE_JIT USE_PCRE2 USE_PCRE2_JIT                      \
@@ -370,6 +367,15 @@ USE_POLL   = default
 # traces are always enabled
 USE_TRACE  = default
 
+# FCGI is always enabled
+USE_FCGI = default
+
+# HTTP/2 is always enabled
+USE_H2 = default
+
+# SPOE is always enabled
+USE_SPOE = default
+
 # SLZ is always supported unless explicitly disabled by passing USE_SLZ=""
 # or disabled by enabling ZLIB using USE_ZLIB=1
 ifeq ($(USE_ZLIB:0=),)
@@ -379,6 +385,13 @@ endif
 # generic system target has nothing specific
 ifeq ($(TARGET),generic)
   set_target_defaults = $(call default_opts,USE_POLL USE_TPROXY)
+endif
+
+# For embedded systems or to be used as a base, tiniest binary with fewest
+# features. Only poll() is enabled to avoid issues with select().
+ifeq ($(TARGET),tiny)
+  set_target_defaults = $(call disable_opts,$(use_opts)) $(call enable_opts,USE_POLL)
+  INSTALL = install -v
 endif
 
 # Haiku
@@ -573,6 +586,18 @@ ifneq ($(USE_ZLIB:0=),)
   ZLIB_LDFLAGS     = $(if $(ZLIB_LIB),-L$(ZLIB_LIB)) -lz
 endif
 
+ifneq ($(USE_H2:0=),)
+  OPTIONS_OBJS   += src/mux_h2.o src/h2.o
+endif
+
+ifneq ($(USE_FCGI:0=),)
+  OPTIONS_OBJS   += src/mux_fcgi.o src/fcgi-app.o src/fcgi.o
+endif
+
+ifneq ($(USE_SPOE:0=),)
+  OPTIONS_OBJS   += src/mux_spop.o src/flt_spoe.o
+endif
+
 ifneq ($(USE_SLZ:0=),)
   OPTIONS_OBJS   += src/slz.o
 endif
@@ -635,6 +660,7 @@ endif
 ifneq ($(USE_OPENSSL_AWSLC:0=),)
   # always automatically set USE_OPENSSL
   USE_OPENSSL     := $(if $(USE_OPENSSL:0=),$(USE_OPENSSL:0=),implicit)
+  OPTIONS_OBJS   += src/fips.o
 endif
 
 # This is for any variant of the OpenSSL API. By default it uses OpenSSL.
@@ -648,7 +674,10 @@ ifneq ($(USE_OPENSSL:0=),)
   OPTIONS_OBJS += src/ssl_sock.o src/ssl_ckch.o src/ssl_ocsp.o src/ssl_crtlist.o       \
                   src/ssl_sample.o src/cfgparse-ssl.o src/ssl_gencert.o                \
                   src/ssl_utils.o src/jwt.o src/ssl_clienthello.o src/jws.o src/acme.o \
-                  src/acme_resolvers.o src/ssl_trace.o src/jwe.o
+                  src/acme_resolvers.o src/jwe.o
+  ifneq ($(USE_TRACE:0=),)
+    OPTIONS_OBJS += src/ssl_trace.o
+  endif
 endif
 
 ifneq ($(USE_ENGINE:0=),)
@@ -809,11 +838,6 @@ ifneq ($(USE_LINUX_CAP:0=),)
   OPTIONS_OBJS   += src/linuxcap.o
 endif
 
-ifneq ($(USE_OT:0=),)
-  $(call warning, The opentracing filter was deprecated in haproxy 3.3 and will be removed in 3.5.)
-  include addons/ot/Makefile
-endif
-
 ifneq ($(EXTRA_MAKE),)
   include $(addsuffix /Makefile.mk,$(EXTRA_MAKE))
 endif
@@ -913,30 +937,31 @@ endif # TARGET
 
 OBJS =
 HATERM_OBJS =
+HALOAD_OBJS =
 
 ifneq ($(EXTRA_OBJS),)
   OBJS += $(EXTRA_OBJS)
 endif
 
-OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
+OBJS += src/mux_h1.o src/log.o						\
         src/server.o src/stream.o src/tcpcheck.o src/http_ana.o		\
-        src/stick_table.o src/tools.o src/mux_spop.o src/sample.o	\
+        src/stick_table.o src/tools.o src/sample.o			\
         src/activity.o src/cfgparse.o src/peers.o src/cli.o		\
         src/backend.o src/connection.o src/resolvers.o src/proxy.o	\
         src/cache.o src/stconn.o src/http_htx.o src/debug.o		\
         src/check.o src/stats-html.o src/haproxy.o src/listener.o	\
         src/applet.o src/pattern.o src/cfgparse-listen.o		\
-        src/flt_spoe.o src/cebis_tree.o src/http_ext.o			\
+        src/cebis_tree.o src/http_ext.o					\
         src/http_act.o src/http_fetch.o src/cebs_tree.o			\
         src/cebib_tree.o src/http_client.o src/dns.o			\
         src/cebb_tree.o src/vars.o src/event_hdl.o src/tcp_rules.o	\
-        src/trace.o src/stats-proxy.o src/pool.o src/stats.o		\
+        src/stats-proxy.o src/pool.o src/stats.o		\
         src/cfgparse-global.o src/filters.o src/mux_pt.o		\
         src/flt_http_comp.o src/sock.o src/h1.o src/sink.o		\
         src/ceba_tree.o src/session.o src/payload.o src/htx.o		\
         src/cebl_tree.o src/ceb32_tree.o src/ceb64_tree.o		\
         src/server_state.o src/proto_rhttp.o src/flt_trace.o src/fd.o	\
-        src/task.o src/map.o src/fcgi-app.o src/h2.o src/mworker.o	\
+        src/task.o src/map.o src/mworker.o				\
         src/tcp_sample.o src/mjson.o src/h1_htx.o src/tcp_act.o		\
         src/ring.o src/flt_bwlim.o src/acl.o src/thread.o src/queue.o	\
         src/http_rules.o src/http.o src/channel.o src/proto_tcp.o	\
@@ -966,7 +991,13 @@ ifneq ($(TRACE),)
   OBJS += src/calltrace.o
 endif
 
-HATERM_OBJS += $(OBJS) src/haterm_init.o
+ifneq ($(USE_TRACE:0=),)
+  OBJS += src/trace.o
+endif
+
+HATERM_OBJS += $(OBJS) src/haterm_init.o src/hbuf.o
+
+HALOAD_OBJS += $(OBJS) src/haload_init.o src/haload.o src/hbuf.o
 
 # Used only for forced dependency checking. May be cleared during development.
 INCLUDES = $(wildcard include/*/*.h)
@@ -1016,6 +1047,9 @@ haproxy: $(OPTIONS_OBJS) $(OBJS)
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 haterm: $(OPTIONS_OBJS) $(HATERM_OBJS)
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+haload: $(OPTIONS_OBJS) $(HALOAD_OBJS)
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 objsize: haproxy

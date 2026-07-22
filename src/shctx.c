@@ -28,7 +28,7 @@
 struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
                                            struct shared_block *first, int data_len)
 {
-	struct shared_block *last = NULL, *block, *sblock;
+	struct shared_block *last = NULL, *block;
 	struct shared_block *ret = first;
 	int remain = 1;
 
@@ -76,7 +76,19 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 		goto out;
 	}
 
-	list_for_each_entry_safe(block, sblock, &shctx->avail, list) {
+	while (data_len > 0) {
+		block = LIST_NEXT(&shctx->avail, struct shared_block *, list);
+		if (&block->list == &shctx->avail)
+			break;
+
+		/* Head of avail is a cold row: give the consumer a chance to
+		 * free room first. If make_room succeeds, freed blocks are
+		 * now at the head of avail and we re-read the head next loop.
+		 */
+		if (block->len && shctx->make_room) {
+			if (shctx->make_room(shctx))
+				continue;
+		}
 
 		/* release callback */
 		if (block->len && shctx->free_block)
@@ -98,13 +110,9 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 		}
 
 		++ret->block_count;
+		ret->last_reserved = block;
 
 		data_len -= shctx->block_size;
-
-		if (data_len <= 0) {
-			ret->last_reserved = block;
-			break;
-		}
 	}
 
 	shctx_wrunlock(shctx);
@@ -114,6 +122,70 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 
 out:
 	return ret;
+}
+
+/*
+ * Truncate a cold row to <new_len> bytes of content. The row keeps the minimum
+ * number of blocks needed to hold <new_len> bytes; tail blocks beyond that
+ * become free blocks. If <new_len> is 0, the row no longer exists and all of
+ * its blocks become free. Freed blocks are moved to the head of the avail
+ * list so the next reservation finds them immediately.
+ *
+ * The row must be cold (refcount 0, thus in the avail list) and the shctx
+ * write lock must be held by the caller.
+ */
+void shctx_row_truncate(struct shared_context *shctx, struct shared_block *first,
+                        int new_len)
+{
+	struct shared_block *new_last = first;
+	struct shared_block *freed_first = NULL;
+	int new_block_count = 1;
+	int i;
+
+	BUG_ON(new_len < 0 || new_len > first->len);
+	BUG_ON(first->refcount > 0);
+
+	if (new_len == 0) {
+		if (shctx->free_block)
+			shctx->free_block(first, shctx->cb_data);
+		freed_first = first;
+	} else {
+		new_block_count = (new_len + shctx->block_size - 1) / shctx->block_size;
+		for (i = 1; i < new_block_count; i++)
+			new_last = LIST_NEXT(&new_last->list, struct shared_block *, list);
+
+		if (new_block_count < first->block_count)
+			freed_first = LIST_NEXT(&new_last->list,
+			                         struct shared_block *, list);
+	}
+
+	if (freed_first) {
+		/* Move the freed chain freed_first..first->last_reserved to the
+		 * head of avail.
+		 */
+		struct shared_block *freed_last = first->last_reserved;
+		struct list *prev = freed_first->list.p;
+		struct list *next = freed_last->list.n;
+
+		prev->n = next;
+		next->p = prev;
+		freed_first->list.p = &shctx->avail;
+		freed_last->list.n = shctx->avail.n;
+		shctx->avail.n->p = &freed_last->list;
+		shctx->avail.n = &freed_first->list;
+	}
+
+	first->len = new_len;
+	first->block_count = new_block_count;
+	first->last_reserved = new_last;
+
+	/* Appending must resume in the partially filled tail block. When
+	 * <new_len> is a multiple of the block size (or 0) there is no such
+	 * block; a NULL <last_append> is correct then because the next
+	 * shctx_row_reserve_hot() call will set it to the first newly
+	 * reserved block (see its "!remain" handling).
+	 */
+	first->last_append = (new_len % shctx->block_size) ? new_last : NULL;
 }
 
 /*
@@ -226,30 +298,24 @@ int shctx_row_data_append(struct shared_context *shctx, struct shared_block *fir
 int shctx_row_data_get(struct shared_context *shctx, struct shared_block *first,
                        unsigned char *dst, int offset, int len)
 {
-	int count = 0, size = 0, start = -1;
+	int count, size, start = -1;
 	struct shared_block *block;
 
-	/* can't copy more */
-	if (len > first->len)
-		len = first->len;
+	/* can't copy more than what is stored past <offset> */
+	if (offset >= first->len)
+		return len;
+	if (len > first->len - offset)
+		len = first->len - offset;
 
-	block = first;
-	count = 0;
-	/* Pass through the blocks to copy them */
-	do {
-		if (count >= first->block_count  || len <= 0)
-			break;
-
-		count++;
-		/* continue until we are in right block
-		   corresponding to the offset */
-		if (count < offset / shctx->block_size + 1)
+	/* Walk the blocks, skipping those that precede the one holding <offset>. */
+	for (block = first, count = 0; count < first->block_count && len > 0;
+	     block = LIST_ELEM(block->list.n, struct shared_block *, list), count++) {
+		if (count < offset / shctx->block_size)
 			continue;
 
-		/* on the first block, data won't possibly began at offset 0 */
+		/* the first copied block may not start at its beginning */
 		if (start == -1)
-			start = offset - (count - 1) * shctx->block_size;
-
+			start = offset - count * shctx->block_size;
 		BUG_ON(start < 0);
 
 		/* size can be lower than a block when copying the last block */
@@ -260,9 +326,7 @@ int shctx_row_data_get(struct shared_context *shctx, struct shared_block *first,
 		dst += size;
 		len -= size;
 		start = 0;
-
-		block = LIST_ELEM(block->list.n, struct shared_block*, list);
-	} while (block != first);
+	}
 	return len;
 }
 

@@ -4094,6 +4094,37 @@ static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct p
 	return 1;
 }
 
+/*
+ * Attempt to mitigate a CSRF attack, by checking that if we have an Origin
+ * or a Referer header, it matches what we expect.
+ */
+static int stats_check_same_origin(const struct htx *htx)
+{
+	struct http_hdr_ctx ctx = { .blk = NULL };
+	struct http_uri_parser parser;
+	struct ist host = IST_NULL;
+	struct ist source;
+
+	if (http_find_header(htx, ist("host"), &ctx, 1))
+		host = ctx.value;
+
+	ctx.blk = NULL;
+	/*
+	 * Check "Origin" first, as it is authoritative, and fallback to
+	 * "Referer" if not present.
+	 */
+	if (!http_find_header(htx, ist("origin"), &ctx, 1))
+		http_find_header(htx, ist("referer"), &ctx, 1);
+
+	/* Neither header present: most likely a non-browser client, allow it. */
+	if (!ctx.blk)
+		return 1;
+
+	parser = http_uri_parser_init(ctx.value);
+	source = http_parse_authority(&parser, 1);
+	return isttest(source) && isteqi(source, host);
+}
+
 /* This function prepares an applet to handle the stats. It can deal with the
  * "100-continue" expectation, check that admin rules are met for POST requests,
  * and program a response message if something was unexpected. It cannot fail
@@ -4250,13 +4281,13 @@ static int http_handle_stats(struct stream *s, struct channel *req, struct proxy
 	if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 		appctx->st0 = STAT_HTTP_HEAD;
 	else if (txn->meth == HTTP_METH_POST) {
-		if (ctx->flags & STAT_F_ADMIN) {
+		if ((ctx->flags & STAT_F_ADMIN) && stats_check_same_origin(htx)) {
 			appctx->st0 = STAT_HTTP_POST;
 			if (msg->msg_state < HTTP_MSG_DATA)
 				req->analysers |= AN_REQ_HTTP_BODY;
 		}
 		else {
-			/* POST without admin level */
+			/* POST without admin level, or potential CSRF attack */
 			ctx->flags &= ~STAT_F_CHUNKED;
 			ctx->st_code = STAT_STATUS_DENY;
 			appctx->st0 = STAT_HTTP_LAST;
@@ -4762,6 +4793,47 @@ int http_forward_proxy_resp(struct stream *s, int final)
 	c_adv(res, data);
 	htx->first = -1;
 	s->scf->bytes_out += data;
+	return 1;
+}
+
+/*
+ * Start a 103 Early Hints response in the response buffer if not already in
+ * progress (txn->status != 103). The caller is responsible for skipping this
+ * call for HTTP/1.0 clients. Returns the htx to which the caller can add Link
+ * headers, or NULL on error.
+ */
+struct htx *http_early_hint_start(struct stream *s)
+{
+	struct htx *htx = htx_from_buf(&s->res.buf);
+
+	if (s->txn.http->status != 103) {
+		struct htx_sl *sl;
+		unsigned int flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|
+		                      HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+
+		sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
+		                    ist("HTTP/1.1"), ist("103"), ist("Early Hints"));
+		if (!sl)
+			return NULL;
+		sl->info.res.status = 103;
+		s->txn.http->status = 103;
+	}
+	return htx;
+}
+
+/*
+ * Finalize a 103 Early Hints response. Returns 1 on success, 0 on error
+ * (caller is responsible for truncating the response buffer on failure).
+ */
+int http_early_hint_end(struct stream *s)
+{
+	struct htx *htx = htxbuf(&s->res.buf);
+
+	if (!htx_add_endof(htx, HTX_BLK_EOH))
+		return 0;
+	if (!http_forward_proxy_resp(s, 0))
+		return 0;
+	s->txn.http->status = 0;
 	return 1;
 }
 

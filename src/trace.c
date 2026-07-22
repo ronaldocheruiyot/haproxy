@@ -139,6 +139,9 @@ int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *
 	if (src->arg_def & TRC_ARGS_HSTRM)
 		ctx.hs = trace_pick_arg(src->arg_def & TRC_ARGS_HSTRM, a1, a2, a3, a4);
 
+	if (src->arg_def & TRC_ARGS_HLDSTRM)
+		ctx.hldstrm = trace_pick_arg(src->arg_def & TRC_ARGS_HLDSTRM, a1, a2, a3, a4);
+
 	if (src->fill_ctx)
 		src->fill_ctx(&ctx, src, a1, a2, a3, a4);
 
@@ -180,9 +183,6 @@ int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *
 
 	if (ctx.srv && !ctx.be)
 		ctx.be = ctx.srv->proxy;
-
-	if (!ctx.be && ctx.conn)
-		ctx.be = objt_proxy(ctx.conn->target);
 
 	/* TODO: add handling of filters here, return if no match (not even update states) */
 

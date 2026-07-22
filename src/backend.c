@@ -854,9 +854,6 @@ int assign_server(struct stream *s)
 		}
 		stream_set_srv_target(s, srv);
 	}
-	else if (s->be->options & (PR_O_DISPATCH | PR_O_TRANSP)) {
-		s->target = &s->be->obj_type;
-	}
 	else {
 		err = SRV_STATUS_NOSRV;
 		goto out;
@@ -950,22 +947,6 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 				set_host_port(*ss, base_port);
 			}
 		}
-	}
-	else if (s->be->options & PR_O_DISPATCH) {
-		if (!sockaddr_alloc(ss, NULL, 0))
-			return SRV_STATUS_INTERNAL;
-
-		/* connect to the defined dispatch addr */
-		**ss = s->be->dispatch_addr;
-	}
-	else if ((s->be->options & PR_O_TRANSP)) {
-		if (!sockaddr_alloc(ss, NULL, 0))
-			return SRV_STATUS_INTERNAL;
-
-		/* in transparent mode, use the original dest addr if no dispatch specified */
-		dst = sc_dst(s->scf);
-		if (dst && (dst->ss_family == AF_INET || dst->ss_family == AF_INET6))
-			**ss = *dst;
 	}
 	else {
 		/* no server and no LB algorithm ! */
@@ -3524,6 +3505,7 @@ smp_fetch_srv_name(const struct arg *args, struct sample *smp, const char *kw, v
 	        return 0;
 
 	smp->data.type = SMP_T_STR;
+	smp->flags = SMP_F_CONST;
 	smp->data.u.str.data = strlen(smp->data.u.str.area);
 
 	return 1;
@@ -3775,6 +3757,24 @@ smp_fetch_srv_uweight(const struct arg *args, struct sample *smp, const char *kw
 }
 
 static int
+smp_fetch_be_max_retries(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	struct proxy *px = NULL;
+
+	if (smp->strm)
+		px = smp->strm->be;
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
+		px = __objt_check(smp->sess->origin)->proxy;
+	if (!px)
+		return 0;
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = px->conn_retries;
+	return 1;
+}
+
+static int
 smp_fetch_be_connect_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
 {
 	struct proxy *px = NULL;
@@ -3947,6 +3947,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "be_id",             smp_fetch_be_id,             0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_name",           smp_fetch_be_name,           0,           NULL, SMP_T_STR,  SMP_USE_BKEND, },
 	{ "be_connect_timeout",smp_fetch_be_connect_timeout,0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ "be_max_retries",    smp_fetch_be_max_retries,    0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_queue_timeout",  smp_fetch_be_queue_timeout,  0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_server_timeout", smp_fetch_be_server_timeout, 0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_sess_rate",      smp_fetch_be_sess_rate,      ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
