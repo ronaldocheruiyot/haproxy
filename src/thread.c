@@ -239,6 +239,13 @@ void *start_extra_tgroup_threads(void *arg)
 	struct tgroup_info *tgi = (struct tgroup_info *)arg;
 	int i;
 
+#ifdef CLONE_FILES
+	if (global.tune.options & GTUNE_NO_TG_FD_SHARING)
+		if (unshare(CLONE_FILES) != 0) {
+			ha_alert("unshare(CLONE_FILES) failed while trying to use one FD table per thread group (%s)\n", strerror(errno));
+			exit(1);
+		}
+#endif
 	/* Create nbthread-1 thread. The first thread is the current one */
 	for (i = 1; i < tgi->count; i++)
 		pthread_create(&ha_pthread[tgi->base + i], NULL, tgi->start, &ha_thread_info[tgi->base + i]);
@@ -271,12 +278,29 @@ void setup_extra_threads(void *(*handler)(void *))
 	/* the startup thread will be thread 1 */
 	ha_pthread[0] = pthread_self();
 
+	/* When FD tables are not shared between thread groups, the poller
+	 * pipes of all threads must be created before any group unshares its
+	 * FD table, so that they are inherited into every group's table and
+	 * cross-group wake_thread() keeps working.
+	 */
+	if (!fd_precreate_poller_pipes()) {
+		ha_alert("Failed to create the poller pipes.\n");
+		exit(1);
+	}
+
 	/* Create one initial thread for each extra thread group. These will
 	 * each be responsible for creating their own extra threads. The first
 	 * group's initial thread is the current thread.
 	 */
 	for (i = 1; i < global.nbtgroups; i++) {
 		ha_tgroup_info[i].start = handler;
+		/*
+		 * Copy the fdtab to the new thread group, it should contain
+		 * file descriptors that are common to all thread groups
+		 */
+		if (global.tune.options & GTUNE_NO_TG_FD_SHARING)
+			memcpy(ha_tgroup_ctx[i].fdtab, ha_tgroup_ctx[0].fdtab,
+			       global.maxsock * sizeof(*fdtab));
 		pthread_create(&ha_pthread[ha_tgroup_info[i].base], NULL, &start_extra_tgroup_threads, &ha_tgroup_info[i]);
 	}
 

@@ -503,7 +503,7 @@ static void srv_state_px_update(const struct proxy *px, int vsn, struct eb_root 
 	struct server *srv;
 	unsigned long key;
 
-	for (srv = px->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &px->servers, el_px) {
 		chunk_printf(&trash, "%s %s", px->id, srv->id);
 		key = XXH3(trash.area, trash.data, 0);
 		node = eb64_lookup(st_tree, key);
@@ -833,11 +833,11 @@ void apply_server_state(void)
 
   no_globalfile:
 	/* parse all proxies and load states form tree (global file) or from local file */
-	for (curproxy = proxies_list; curproxy != NULL; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		struct eb_root local_state_tree = EB_ROOT_UNIQUE;
 
 		/* Must be an enabled backend with at least a server */
-		if (!(curproxy->cap & PR_CAP_BE) || (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !curproxy->srv)
+		if (!(curproxy->cap & PR_CAP_BE) || (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || LIST_ISEMPTY(&curproxy->servers))
 			continue; /* next proxy */
 
 		/* Mode must be specified */

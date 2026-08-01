@@ -468,7 +468,7 @@ flt_init_all()
 	struct proxy *px;
 	int err_code = ERR_NONE;
 
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &main_proxies, el) {
 		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
 			continue;
 
@@ -490,7 +490,7 @@ flt_init_all_per_thread()
 	struct proxy *px;
 	int err_code = 0;
 
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &main_proxies, el) {
 		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
 			continue;
 
@@ -573,7 +573,7 @@ flt_deinit_all_per_thread()
 {
 	struct proxy *px;
 
-	for (px = proxies_list; px; px = px->next)
+	list_for_each_entry(px, &main_proxies, el)
 		flt_deinit_per_thread(px);
 }
 
@@ -1329,7 +1329,15 @@ flt_xfer_data(struct stream *s, struct channel *chn, unsigned int an_bit)
 
 	/* Wait for data */
 	DBG_TRACE_DEVEL("waiting for more data", STRM_EV_STRM_ANA|STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+
+	/* DATA filtering is not finished and some data may still be blocked in
+	 * the channel. So take care to disable auto close
+	 */
+	if (HAS_DATA_FILTERS(s, chn))
+		channel_dont_close(chn);
+
 	return 0;
+
  end:
 	/* Terminate the data filtering. If <ret> is negative, an error was
 	 * encountered during the filtering. */

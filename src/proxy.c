@@ -73,8 +73,17 @@
 __decl_spinlock(proxies_del_lock);
 
 int listeners;	/* # of proxy listeners, set by cfgparse */
-struct proxy *proxies_list  = NULL;     /* list of main proxies */
-struct list proxies = LIST_HEAD_INIT(proxies); /* list of all proxies */
+
+/* List of non-default and non-internal proxies, except mworker and cli_fe which are stored in it.
+ * Used for check_config_validity() post init and most runtime operations (stats, ...).
+ */
+struct list main_proxies = LIST_HEAD_INIT(main_proxies);
+
+/* List of all proxies, except defaults.
+ * Currently only used for post_proxy_check_fct and post_server_check_fct post init.
+ */
+struct list all_proxies = LIST_HEAD_INIT(all_proxies);
+
 struct ceb_root *used_proxy_id = NULL; /* list of proxy IDs in use */
 struct ceb_root *proxy_by_name = NULL; /* tree of proxies sorted by name */
 struct ceb_root *defproxy_by_name = NULL; /* tree of default proxies sorted by name (dups possible) */
@@ -317,7 +326,7 @@ static inline void proxy_free_common(struct proxy *px)
  */
 void deinit_proxy(struct proxy *p)
 {
-	struct server *s;
+	struct server *s, *s_back;
 	struct cap_hdr *h,*h_next;
 	struct listener *l,*l_next;
 	struct bind_conf *bind_conf, *bind_back;
@@ -397,15 +406,14 @@ void deinit_proxy(struct proxy *p)
 		h = h_next;
 	}/* end while(h) */
 
-	s = p->srv;
-	while (s) {
+	list_for_each_entry_safe(s, s_back, &p->servers, el_px) {
 		list_for_each_entry(srvdf, &server_deinit_list, list)
 			srvdf->fct(s);
 
 		if (p->lbprm.ops && p->lbprm.ops->server_deinit)
 			p->lbprm.ops->server_deinit(s);
 
-		s = srv_drop(s);
+		srv_drop(s);
 	}/* end while(s) */
 
 	/* also free default-server parameters since some of them might have
@@ -1560,6 +1568,7 @@ void init_new_proxy(struct proxy *p)
 	memset(p, 0, sizeof(struct proxy));
 	p->obj_type = OBJ_TYPE_PROXY;
 	LIST_INIT(&p->global_list);
+	LIST_INIT(&p->servers);
 	LIST_INIT(&p->el);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
@@ -1652,6 +1661,7 @@ int proxy_init_per_thr(struct proxy *px)
 
 int proxy_finalize(struct proxy *px, int *err_code)
 {
+	struct list tmp_list = LIST_HEAD_INIT(tmp_list);
 	struct bind_conf *bind_conf;
 	struct server *newsrv;
 	struct switching_rule *rule;
@@ -1986,7 +1996,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			free(px->defbe.name);
 			px->defbe.be = target;
 			/* Emit a warning if this proxy also has some servers */
-			if (px->srv) {
+			if (!LIST_ISEMPTY(&px->servers)) {
 				ha_warning("In proxy '%s', the 'default_backend' rule always has precedence over the servers, which will never be used.\n",
 				           px->id);
 				*err_code |= ERR_WARN;
@@ -2165,7 +2175,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 #endif
 
 	/* Warn is a switch-mode http is used on a TCP listener with servers but no backend */
-	if (!px->defbe.name && LIST_ISEMPTY(&px->switching_rules) && px->srv) {
+	if (!px->defbe.name && LIST_ISEMPTY(&px->switching_rules) && !LIST_ISEMPTY(&px->servers)) {
 		if ((px->options & PR_O_HTTP_UPG) && px->mode == PR_MODE_TCP)
 			ha_warning("Proxy '%s' : 'switch-mode http' configured for a %s %s with no backend. "
 			           "Incoming connections upgraded to HTTP cannot be routed to TCP servers\n",
@@ -2425,7 +2435,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 
 	if (!(px->cap & PR_CAP_INT) && (px->mode == PR_MODE_TCP || px->mode == PR_MODE_HTTP) &&
 	    (((px->cap & PR_CAP_FE) && !px->timeout.client) ||
-	     ((px->cap & PR_CAP_BE) && (px->srv) &&
+	     ((px->cap & PR_CAP_BE) && !LIST_ISEMPTY(&px->servers) &&
 	      (!px->timeout.connect ||
 	       (!px->timeout.server && (px->mode == PR_MODE_HTTP || !px->timeout.tunnel)))))) {
 		ha_warning("missing timeouts for %s '%s'.\n"
@@ -2485,19 +2495,6 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			break;
 	}
 
-	/* first, we will invert the servers list order */
-	newsrv = NULL;
-	while (px->srv) {
-		struct server *next;
-
-		next = px->srv->next;
-		px->srv->next = newsrv;
-		newsrv = px->srv;
-		if (!next)
-			break;
-		px->srv = next;
-	}
-
 	/* Check that no server name conflicts. This causes trouble in the stats.
 	 * We only emit an error for the first conflict affecting each server,
 	 * in order to avoid combinatory explosion if all servers have the same
@@ -2505,7 +2502,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	 * we simply have to check for the current server's duplicates to spot
 	 * conflicts.
 	 */
-	for (newsrv = px->srv; newsrv; newsrv = newsrv->next) {
+	list_for_each_entry(newsrv, &px->servers, el_px) {
 		struct server *other_srv;
 
 		/* Note: internal servers are not always registered and
@@ -2526,8 +2523,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 
 	/* assign automatic UIDs to servers which don't have one yet */
 	next_id = 1;
-	newsrv = px->srv;
-	while (newsrv != NULL) {
+	list_for_each_entry(newsrv, &px->servers, el_px) {
 		if (!newsrv->puid) {
 			/* server ID not set, use automatic numbering with first
 			 * spare entry starting with next_svid.
@@ -2538,7 +2534,6 @@ int proxy_finalize(struct proxy *px, int *err_code)
 		}
 
 		next_id++;
-		newsrv = newsrv->next;
 	}
 
 	px->lbprm.wmult = 1; /* default weight multiplier */
@@ -2549,8 +2544,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	 * tasks to fill the emptied slots when a connection leaves.
 	 * Also, resolve deferred tracking dependency if needed.
 	 */
-	newsrv = px->srv;
-	while (newsrv != NULL) {
+	list_for_each_entry(newsrv, &px->servers, el_px) {
 		set_usermsgs_ctx(newsrv->conf.file, newsrv->conf.line, &newsrv->obj_type);
 
 		srv_minmax_conn_apply(newsrv);
@@ -2604,7 +2598,6 @@ int proxy_finalize(struct proxy *px, int *err_code)
 
 	next_srv:
 		reset_usermsgs_ctx();
-		newsrv = newsrv->next;
 	}
 
 	/*
@@ -2615,11 +2608,8 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	 * have been provided yet.
 	 */
 	if (px->ck_opts & PR_CK_DYNAMIC) {
-		newsrv = px->srv;
-		while (newsrv != NULL) {
+		list_for_each_entry(newsrv, &px->servers, el_px)
 			srv_set_dyncookie(newsrv);
-			newsrv = newsrv->next;
-		}
 
 	}
 	/* We have to initialize the server lookup mechanism depending
@@ -2741,8 +2731,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	/*
 	 * ensure that we're not cross-dressing a TCP server into HTTP.
 	 */
-	newsrv = px->srv;
-	while (newsrv != NULL) {
+	list_for_each_entry(newsrv, &px->servers, el_px) {
 		if ((px->mode != PR_MODE_HTTP) && newsrv->rdr_len) {
 			ha_alert("%s '%s' : server cannot have cookie or redirect prefix in non-HTTP mode.\n",
 			         proxy_type_str(px), px->id);
@@ -2782,8 +2771,6 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			*err_code |= ERR_FATAL | ERR_ALERT;
 			goto out;
 		}
-
-		newsrv = newsrv->next;
 	}
 
 	/* Check filter configuration, if any */
@@ -2846,7 +2833,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 
 	/* Check the mux protocols, if any, for each server attached to
 	 * the current proxy */
-	for (newsrv = px->srv; newsrv; newsrv = newsrv->next) {
+	list_for_each_entry(newsrv, &px->servers, el_px) {
 		int mode = conn_pr_mode_to_proto_mode(px->mode);
 		const struct mux_proto_list *mux_ent;
 
@@ -3205,7 +3192,7 @@ int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char *
 		proxy_store_name(px);
 
 	if (!(cap & PR_CAP_DEF))
-		LIST_APPEND(&proxies, &px->global_list);
+		LIST_APPEND(&all_proxies, &px->global_list);
 
 	return 1;
 
@@ -3864,15 +3851,13 @@ struct task *hard_stop(struct task *t, void *context, unsigned int state)
 
 	ha_warning("soft-stop running for too long, performing a hard-stop.\n");
 	send_log(NULL, LOG_WARNING, "soft-stop running for too long, performing a hard-stop.\n");
-	p = proxies_list;
-	while (p) {
+	list_for_each_entry(p, &main_proxies, el) {
 		if ((p->cap & PR_CAP_FE) && (p->feconn > 0)) {
 			ha_warning("Proxy %s hard-stopped (%d remaining conns will be closed).\n",
 				   p->id, p->feconn);
 			send_log(p, LOG_WARNING, "Proxy %s hard-stopped (%d remaining conns will be closed).\n",
 				p->id, p->feconn);
 		}
-		p = p->next;
 	}
 
 	thread_isolate();
@@ -3924,12 +3909,10 @@ static void do_soft_stop_now()
 	thread_release();
 
 	/* Loop on proxies to stop backends */
-	p = proxies_list;
-	while (p) {
+	list_for_each_entry(p, &main_proxies, el) {
 		HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
 		proxy_cond_disable(p);
 		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
-		p = p->next;
 	}
 
 	/* signal zero is used to broadcast the "stopping" event */
@@ -3993,7 +3976,7 @@ int pause_proxy(struct proxy *p)
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
 		suspend_listener(l, 1, 0);
 
-	if (p->li_ready) {
+	if (p->li_ready && !tg_agents_enabled) {
 		ha_warning("%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
 		send_log(p, LOG_WARNING, "%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
 		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
@@ -4271,7 +4254,7 @@ void proxy_adjust_all_maxconn()
 	struct proxy *curproxy;
 	struct switching_rule *swrule1, *swrule2;
 
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		if (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
 			continue;
 
@@ -4315,7 +4298,7 @@ void proxy_adjust_all_maxconn()
 	/* automatically compute fullconn if not set. We must not do it in the
 	 * loop above because cross-references are not yet fully resolved.
 	 */
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		if (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
 			continue;
 
@@ -4502,9 +4485,9 @@ static int dump_servers_state(struct appctx *appctx)
 	char *srvrecord;
 
 	if (!ctx->sv)
-		watcher_attach(&ctx->srv_watch, px->srv);
+		watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 
-	for (; ctx->sv; watcher_next(&ctx->srv_watch, ctx->sv->next)) {
+	for (; ctx->sv; watcher_next(&ctx->srv_watch, proxy_next_server(ctx->sv))) {
 		srv = ctx->sv;
 
 		dump_server_addr(&srv->addr, srv_addr);
@@ -4592,10 +4575,10 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 		ctx->state = SHOW_SRV_LIST;
 
 		if (!ctx->px)
-			watcher_attach(&ctx->px_watch, proxies_list);
+			watcher_attach(&ctx->px_watch, main_proxies_first());
 	}
 
-	for (; ctx->px; watcher_next(&ctx->px_watch, ctx->px->next)) {
+	for (; ctx->px; watcher_next(&ctx->px_watch, main_proxies_next(ctx->px))) {
 		curproxy = ctx->px;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
@@ -4629,11 +4612,11 @@ static int cli_io_handler_show_backend(struct appctx *appctx)
 
 		watcher_init(&ctx->px_watch, &ctx->px, offsetof(struct proxy, watcher_list));
 		/* This will automatically update ctx->px pointer. */
-		watcher_attach(&ctx->px_watch, proxies_list);
+		watcher_attach(&ctx->px_watch, main_proxies_first());
 	}
 
-	for (; ctx->px; watcher_next(&ctx->px_watch, ctx->px->next)) {
-		curproxy = ctx->px;
+	for (; ctx->px; watcher_next(&ctx->px_watch, main_proxies_next(ctx->px))) {
+		curproxy = appctx->svcctx;
 
 		/* looking for non-internal backends only */
 		if ((curproxy->cap & (PR_CAP_BE|PR_CAP_INT)) != PR_CAP_BE)
@@ -4675,7 +4658,7 @@ static int cli_parse_enable_dyncookie_backend(char **args, char *payload, struct
 	px->ck_opts |= PR_CK_DYNAMIC;
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
-	for (s = px->srv; s != NULL; s = s->next) {
+	list_for_each_entry(s, &px->servers, el_px) {
 		HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 		srv_set_dyncookie(s);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
@@ -4710,7 +4693,7 @@ static int cli_parse_disable_dyncookie_backend(char **args, char *payload, struc
 	px->ck_opts &= ~PR_CK_DYNAMIC;
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
-	for (s = px->srv; s != NULL; s = s->next) {
+	list_for_each_entry(s, &px->servers, el_px) {
 		HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 		if (!(s->flags & SRV_F_COOKIESET))
 			ha_free(&s->cookie);
@@ -4755,7 +4738,7 @@ static int cli_parse_set_dyncookie_key_backend(char **args, char *payload, struc
 	px->dyncookie_key = newkey;
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
-	for (s = px->srv; s != NULL; s = s->next) {
+	list_for_each_entry(s, &px->servers, el_px) {
 		HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 		srv_set_dyncookie(s);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
@@ -4837,7 +4820,7 @@ static int cli_parse_shutdown_frontend(char **args, char *payload, struct appctx
  */
 static int cli_parse_add_backend(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct proxy *px, *defpx, *next;
+	struct proxy *px, *defpx;
 	struct post_proxy_check_fct *ppcf;
 	const char *be_name, *def_name, *guid = NULL, *err;
 	char *msg = NULL;
@@ -4972,16 +4955,11 @@ static int cli_parse_add_backend(char **args, char *payload, struct appctx *appc
 	proxy_index_id(px);
 	dynpx_next_id = px->uuid;
 
-	if (!proxies_list) {
-		proxies_list = px;
-	}
-	else {
-		for (next = proxies_list; next->next; next = next->next)
-			;
-		next->next = px;
-	}
-	px->next = NULL;
-
+	/* Insert <px> into <main_proxies> list of visible proxies. Note that
+	 * insertion in <all_proxies> has already been performed in
+	 * setup_new_proxy() via alloc_new_proxy().
+	 */
+	main_proxies_register(px);
 	thread_release();
 
 	if (unlikely(!be_supports_dynamic_srv(px, &msg)))
@@ -5060,7 +5038,7 @@ int be_check_for_deletion(const char *bename, struct proxy **pb, const char **pm
 		goto out;
 	}
 
-	if (be->srv) {
+	if (!LIST_ISEMPTY(&be->servers)) {
 		msg = "Only a backend without server can be deleted.";
 		goto out;
 	}
@@ -5087,7 +5065,7 @@ int be_check_for_deletion(const char *bename, struct proxy **pb, const char **pm
 static int cli_parse_delete_backend(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct watcher *px_watch;
-	struct proxy *px, *prev;
+	struct proxy *px;
 	const char *msg;
 	char *be_name;
 	int ret;
@@ -5111,22 +5089,14 @@ static int cli_parse_delete_backend(char **args, char *payload, struct appctx *a
 
 	while (!MT_LIST_ISEMPTY(&px->watcher_list)) {
 		px_watch = MT_LIST_NEXT(&px->watcher_list, struct watcher *, el);
-		watcher_next(px_watch, px->next);
+		watcher_next(px_watch, main_proxies_next(px));
 	}
 
 	ceb32_item_delete(&used_proxy_id, conf.uuid_node, uuid, px);
 	cebis_item_delete(&proxy_by_name, conf.name_node, id, px);
 
-	/* Detach backend from global proxies_list. */
-	if (proxies_list == px) {
-		proxies_list = px->next;
-	}
-	else {
-		for (prev = proxies_list->next; prev && prev->next != px; prev = prev->next)
-			;
-		BUG_ON(!prev); /* Proxy instance not found in global list ? */
-		prev->next = px->next;
-	}
+	/* Detach backend from global main_proxies. */
+	LIST_DELETE(&px->el);
 
 	px->flags |= PR_FL_DELETED;
 
@@ -5260,6 +5230,8 @@ struct show_errors_ctx {
 	int iid;		/* if >= 0, ID of the proxy to filter on */
 	int ptr;		/* <0: headers, >=0 : text pointer to restart from */
 	int bol;		/* pointer to beginning of current line */
+
+	struct watcher px_watch; /* watcher to automatically update px pointer on backend deletion */
 };
 
 /* "show errors" handler for the CLI. Returns 0 if wants to continue, 1 to stop
@@ -5292,7 +5264,10 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
 		ctx->flag |= 4; // ignore response
 	else if (strcmp(args[3], "response") == 0)
 		ctx->flag |= 2; // ignore request
+
 	ctx->px = NULL;
+	watcher_init(&ctx->px_watch, &ctx->px, offsetof(struct proxy, watcher_list));
+
 	return 0;
 }
 
@@ -5322,7 +5297,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		if (applet_putchk(appctx, &trash) == -1)
 			goto cant_send;
 
-		ctx->px = proxies_list;
+		watcher_attach(&ctx->px_watch, main_proxies_first());
 		ctx->bol = 0;
 		ctx->ptr = -1;
 	}
@@ -5409,8 +5384,10 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 			chunk_appendf(&trash, "  \n");
 
-			if (applet_putchk(appctx, &trash) == -1)
+			if (STRESS_RUN1(applet_putchk_stress(appctx, &trash) == -1,
+			                applet_putchk(appctx, &trash) == -1)) {
 				goto cant_send_unlock;
+			}
 
 			ctx->ptr = 0;
 			ctx->ev_id = es->ev_id;
@@ -5438,8 +5415,10 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 				goto cant_send_unlock;
 			}
 
-			if (applet_putchk(appctx, &trash) == -1)
+			if (STRESS_RUN1(applet_putchk_stress(appctx, &trash) == -1,
+			                applet_putchk(appctx, &trash) == -1)) {
 				goto cant_send_unlock;
+			}
 
 			ctx->ptr = newptr;
 			ctx->bol = newline;
@@ -5450,7 +5429,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		ctx->ptr = -1;
 		ctx->flag ^= 1;
 		if (!(ctx->flag & 1))
-			ctx->px = ctx->px->next;
+			watcher_next(&ctx->px_watch, main_proxies_next(ctx->px));
 	}
 
 	/* dump complete */

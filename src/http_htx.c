@@ -791,8 +791,11 @@ int http_remove_header(struct htx *htx, struct http_hdr_ctx *ctx)
 		start--;
 		len++;
 	}
-	/* Update the block content and its len */
-	memmove(start, start+len, v.len-len);
+	/* Update the block content and its len. Only the bytes located after the
+	 * removed part must be moved, so the offset of <start> inside the value
+	 * must be taken into account.
+	 */
+	memmove(start, start+len, istend(v) - (start+len));
 	htx_change_blk_value_len(htx, blk, v.len-len);
 
 	/* Finally update the ctx */
@@ -1695,6 +1698,10 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 				goto error;
 			}
 			obj = strdup(args[cur_arg]);
+			if (!obj) {
+				memprintf(errmsg, "out of memory");
+				goto error;
+			}
 			objlen = strlen(args[cur_arg]);
 			reply->type = HTTP_REPLY_LOGFMT;
 			lf_expr_init(&reply->body.fmt);
@@ -1876,6 +1883,9 @@ int http_scheme_based_normalize(struct htx *htx)
 		/* reconstruct the uri with removal of the port */
 		struct buffer *temp = alloc_trash_chunk();
 		struct ist meth, vsn;
+
+		if (!temp)
+			goto fail;
 
 		/* meth */
 		chunk_memcat(temp, HTX_SL_REQ_MPTR(sl), HTX_SL_REQ_MLEN(sl));

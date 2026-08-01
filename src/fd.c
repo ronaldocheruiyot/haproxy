@@ -98,9 +98,10 @@
 #include <haproxy/tools.h>
 
 
-struct fdtab *fdtab             __read_mostly = NULL;  /* array of all the file descriptors */
-struct polled_mask *polled_mask __read_mostly = NULL;  /* Array for the polled_mask of each fd */
-struct fdinfo *fdinfo           __read_mostly = NULL;  /* less-often used infos for file descriptors */
+THREAD_LOCAL struct fdtab *fdtab = NULL;  /* array of all the file descriptors */
+static struct fdtab *_fdtab;
+THREAD_LOCAL struct polled_mask *polled_mask = NULL;  /* Array for the polled_mask of each fd */
+static struct polled_mask *_polled_mask;
 int totalconn;                  /* total # of terminated sessions */
 int actconn;                    /* # of active sessions */
 
@@ -340,7 +341,26 @@ void _fd_delete_orphan(int fd)
 	if (fd_nbupdt > 0 && fd_updt[fd_nbupdt - 1] == fd)
 		fd_nbupdt--;
 
-	port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
+	if (unlikely(fdtab[fd].state & FD_HAS_PORT)) {
+		struct sockaddr_storage sa;
+		socklen_t addrlen = sizeof(sa);
+		int port;
+
+		BUG_ON(!(fdtab[fd].state & FD_OWNER_PR));
+		/*
+		 * We have to release the port, let's use getsockname()
+		 * to figure out what the port was.
+		 */
+		BUG_ON(getsockname(fd, (struct sockaddr *)&sa, &addrlen) != 0);
+		if (sa.ss_family == AF_INET)
+			port = ((struct sockaddr_in *)&sa)->sin_port;
+		else if (sa.ss_family == AF_INET6)
+			port = ((struct sockaddr_in6 *)&sa)->sin6_port;
+		else
+			ABORT_NOW();
+		port_range_release_port(fdtab[fd].owner, port);
+	}
+
 	polled_mask[fd].poll_recv = polled_mask[fd].poll_send = 0;
 
 	fdtab[fd].state = 0;
@@ -348,7 +368,6 @@ void _fd_delete_orphan(int fd)
 #ifdef DEBUG_FD
 	fdtab[fd].event_count = 0;
 #endif
-	fdinfo[fd].port_range = NULL;
 	fdtab[fd].owner = NULL;
 
 	/* perform the close() call last as it's what unlocks the instant reuse
@@ -533,6 +552,8 @@ int fd_takeover(int fd, void *expected_owner)
 
 	/* We're taking a connection from a different thread group */
 	if ((fdtab[fd].refc_tgid & 0x7fff) != tgid) {
+		BUG_ON(global.tune.options & GTUNE_NO_TG_FD_SHARING);
+
 		changing_tgid = 1;
 
 		old_tgid = fd_tgid(fd);
@@ -1128,12 +1149,37 @@ static int alloc_pollers_per_thread()
 	return fd_updt != NULL;
 }
 
+static int precreated_poller_pipes[MAX_THREADS][2];
+
+/*
+ * Create the pipes before we create the threads, as they may not share
+ * their file descriptor tables.
+ */
+int fd_precreate_poller_pipes(void)
+{
+	int i;
+
+	for (i = 0; i < global.nbthread; i++) {
+		if (pipe(precreated_poller_pipes[i]) < 0)
+			return 0;
+	}
+	return 1;
+}
+
 /* Initialize the pollers per thread.*/
 static int init_pollers_per_thread()
 {
 	int mypipe[2];
 
-	if (pipe(mypipe) < 0)
+	/*
+	 * The master does not get to pre-create pipes, so do it
+	 * now.
+	 */
+	if (!master) {
+		mypipe[0] = precreated_poller_pipes[tid][0];
+		mypipe[1] = precreated_poller_pipes[tid][1];
+	}
+	else if (pipe(mypipe) < 0)
 		return 0;
 
 	poller_rd_pipe = mypipe[0];
@@ -1174,25 +1220,48 @@ int init_pollers()
 {
 	int p;
 	struct poller *bp;
+	int nbfdtab;
 
+
+	if (global.tune.options & GTUNE_NO_TG_FD_SHARING) {
+		nbfdtab = global.nbtgroups;
+	} else
+		nbfdtab = 1;
 	/* always provide an aligned fdtab */
-	if ((fdtab = ha_aligned_zalloc(64, array_size_or_fail(global.maxsock, sizeof(*fdtab)))) == NULL) {
+	if ((_fdtab = ha_aligned_zalloc(64, array_size_or_fail(global.maxsock, nbfdtab * sizeof(*fdtab)))) == NULL) {
 		ha_alert("Not enough memory to allocate %d entries for fdtab!\n", global.maxsock);
 		goto fail_tab;
 	}
-	vma_set_name(fdtab, global.maxsock * sizeof(*fdtab), "fd", "fdtab");
 
-	if ((polled_mask = calloc(global.maxsock, sizeof(*polled_mask))) == NULL) {
+	for (p = 0; p < global.nbtgroups; p++) {
+		if (global.tune.options & GTUNE_NO_TG_FD_SHARING) {
+			ha_tgroup_ctx[p].fdtab = (void *)((char *)(void *)_fdtab + p * global.maxsock * sizeof(*fdtab));
+		} else
+			ha_tgroup_ctx[p].fdtab = _fdtab;
+	}
+	/*
+	 * Immediately set the fdtab for our thread, as we'll need it soon
+	 */
+	fdtab = ha_tgroup_ctx[0].fdtab;
+	vma_set_name(_fdtab, global.maxsock * sizeof(*fdtab) * nbfdtab, "fd", "fdtab");
+
+	if ((_polled_mask = calloc(global.maxsock, nbfdtab * sizeof(*polled_mask))) == NULL) {
 		ha_alert("Not enough memory to allocate %d entries for polled_mask!\n", global.maxsock);
 		goto fail_polledmask;
 	}
-	vma_set_name(polled_mask, global.maxsock * sizeof(*polled_mask), "fd", "polled_mask");
 
-	if ((fdinfo = calloc(global.maxsock, sizeof(*fdinfo))) == NULL) {
-		ha_alert("Not enough memory to allocate %d entries for fdinfo!\n", global.maxsock);
-		goto fail_info;
+	/*
+	 * As for fdtab, get on polled_mask per thread group, if needed.
+	 */
+	for (p = 0; p < global.nbtgroups; p++) {
+		if (global.tune.options & GTUNE_NO_TG_FD_SHARING)
+			ha_tgroup_ctx[p].polled_mask = _polled_mask + p * global.maxsock;
+		else
+			ha_tgroup_ctx[p].polled_mask = _polled_mask;
 	}
-	vma_set_name(fdinfo, global.maxsock * sizeof(*fdinfo), "fd", "fdinfo");
+	/* immediately set it for the boot thread as well */
+	polled_mask = ha_tgroup_ctx[0].polled_mask;
+	vma_set_name(_polled_mask, global.maxsock * sizeof(*polled_mask) * nbfdtab, "fd", "polled_mask");
 
 	for (p = 0; p < MAX_TGROUPS; p++)
 		update_list[p].first = update_list[p].last = -1;
@@ -1204,6 +1273,7 @@ int init_pollers()
 
 	do {
 		bp = NULL;
+redo:
 		for (p = 0; p < nbpollers; p++)
 			if (!bp || (pollers[p].pref > bp->pref))
 				bp = &pollers[p];
@@ -1211,17 +1281,25 @@ int init_pollers()
 		if (!bp || bp->pref == 0)
 			break;
 
+		if ((global.tune.options & GTUNE_NO_TG_FD_SHARING) &&
+		    !(bp->flags & HAP_POLL_F_NO_FD_SHARING)) {
+			ha_alert("Can't use poller '%s' with per-thread-group FD tables\n", bp->name);
+			bp->pref = 0;
+			goto redo;
+		}
+
 		if (bp->init(bp)) {
 			memcpy(&cur_poller, bp, sizeof(*bp));
 			return 1;
 		}
 	} while (!bp || bp->pref == 0);
 
-	free(fdinfo);
  fail_info:
-	free(polled_mask);
+	free(_polled_mask);
+	_polled_mask = polled_mask = NULL;
  fail_polledmask:
-	ha_aligned_free(fdtab);
+	ha_aligned_free(_fdtab);
+	_fdtab = fdtab = NULL;
  fail_tab:
 	return 0;
 }
@@ -1241,9 +1319,13 @@ void deinit_pollers() {
 			bp->term(bp);
 	}
 
-	ha_free(&fdinfo);
-	ha_aligned_free(fdtab);
-	ha_free(&polled_mask);
+	/* free the backing areas, not the (possibly per-group) thread-local
+	 * pointers which may not point to the start of the allocations.
+	 */
+	ha_aligned_free(_fdtab);
+	_fdtab = fdtab = NULL;
+	ha_free(&_polled_mask);
+	polled_mask = NULL;
 }
 
 /*

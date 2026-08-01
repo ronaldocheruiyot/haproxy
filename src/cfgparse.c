@@ -2270,7 +2270,8 @@ err:
 int check_config_validity()
 {
 	int cfgerr = 0, ret;
-	struct proxy *init_proxies_list = NULL, *defpx;
+	struct proxy *defpx;
+	struct list *init_proxies_list = NULL;
 	struct stktable *t;
 	struct server *newsrv = NULL;
 	struct mt_list back;
@@ -2358,24 +2359,11 @@ int check_config_validity()
 	if (err_code != ERR_NONE)
 		goto out;
 
-	/* first, we will invert the proxy list order */
-	curproxy = NULL;
-	while (proxies_list) {
-		struct proxy *next;
-
-		next = proxies_list->next;
-		proxies_list->next = curproxy;
-		curproxy = proxies_list;
-		if (!next)
-			break;
-		proxies_list = next;
-	}
-
 	/*
 	 * we must finish to initialize certain things on the servers,
 	 * as some of the fields may be accessed soon
 	 */
-	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &servers_list, global_list, back) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &all_servers, global_list, back) {
 		err_code |= srv_preinit(newsrv);
 		if (err_code & ERR_CODE)
 			goto out;
@@ -2410,10 +2398,10 @@ int check_config_validity()
 	}
 
 	/* starting to initialize the main proxies list */
-	init_proxies_list = proxies_list;
+	init_proxies_list = &main_proxies;
 
 init_proxies_list_stage1:
-	for (curproxy = init_proxies_list; curproxy; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, init_proxies_list, el) {
 		proxy_init_per_thr(curproxy);
 
 		/* Assign automatic UUID if unset except for internal proxies.
@@ -2468,18 +2456,14 @@ init_proxies_list_stage1:
 	 * We have just initialized the main proxies list
 	 * we must also configure the log-forward proxies list
 	 */
-	if (init_proxies_list == proxies_list) {
-		init_proxies_list = cfg_log_forward;
-		/* check if list is not null to avoid infinite loop */
-		if (init_proxies_list)
-			goto init_proxies_list_stage1;
+	if (init_proxies_list == &main_proxies) {
+		init_proxies_list = &cfg_log_forward;
+		goto init_proxies_list_stage1;
 	}
 
-	if (init_proxies_list == cfg_log_forward) {
-		init_proxies_list = sink_proxies_list;
-		/* check if list is not null to avoid infinite loop */
-		if (init_proxies_list)
-			goto init_proxies_list_stage1;
+	if (init_proxies_list == &cfg_log_forward) {
+		init_proxies_list = &sink_proxies_list;
+		goto init_proxies_list_stage1;
 	}
 
 	/***********************************************************/
@@ -2514,10 +2498,10 @@ init_proxies_list_stage1:
 	/* perform the final checks before creating tasks */
 
 	/* starting to initialize the main proxies list */
-	init_proxies_list = proxies_list;
+	init_proxies_list = &main_proxies;
 
 init_proxies_list_stage2:
-	for (curproxy = init_proxies_list; curproxy; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, init_proxies_list, el) {
 		struct listener *listener;
 		unsigned int next_id;
 
@@ -2619,29 +2603,27 @@ init_proxies_list_stage2:
 		}
 	}
 
+	curproxy = NULL;
+
 	/*
 	 * We have just initialized the main proxies list
 	 * we must also configure the log-forward proxies list
 	 */
-	if (init_proxies_list == proxies_list) {
-		init_proxies_list = cfg_log_forward;
-		/* check if list is not null to avoid infinite loop */
-		if (init_proxies_list)
-			goto init_proxies_list_stage2;
+	if (init_proxies_list == &main_proxies) {
+		init_proxies_list = &cfg_log_forward;
+		goto init_proxies_list_stage2;
 	}
 
-	if (init_proxies_list == cfg_log_forward) {
-		init_proxies_list = sink_proxies_list;
-		/* check if list is not null to avoid infinite loop */
-		if (init_proxies_list)
-			goto init_proxies_list_stage2;
+	if (init_proxies_list == &cfg_log_forward) {
+		init_proxies_list = &sink_proxies_list;
+		goto init_proxies_list_stage2;
 	}
 
 	/*
 	 * Recount currently required checks.
 	 */
 
-	for (curproxy=proxies_list; curproxy; curproxy=curproxy->next) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		int optnum;
 
 		for (optnum = 0; cfg_opts[optnum].name; optnum++)
@@ -2807,7 +2789,7 @@ init_proxies_list_stage2:
 	 * be done earlier because the data size may be discovered while parsing
 	 * other proxies.
 	 */
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		if ((curproxy->flags & PR_FL_DISABLED) || !curproxy->table)
 			continue;
 
@@ -2857,7 +2839,7 @@ init_proxies_list_stage2:
 
 	/* Update server_state_file_name to backend name if backend is supposed to use
 	 * a server-state file locally defined and none has been provided */
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		if (curproxy->load_server_state_from_file == PR_SRV_STATE_FILE_LOCAL &&
 		    curproxy->server_state_file_name == NULL)
 			curproxy->server_state_file_name = strdup(curproxy->id);

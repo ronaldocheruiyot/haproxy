@@ -19,6 +19,7 @@
 #include <import/eb32tree.h>
 #include <haproxy/api.h>
 #include <haproxy/backend.h>
+#include <haproxy/proxy.h>
 #include <haproxy/queue.h>
 #include <haproxy/server-t.h>
 
@@ -106,7 +107,7 @@ static void fas_set_server_status_down(struct server *srv)
 			 */
 			struct server *srv2 = p->lbprm.fbck;
 			do {
-				srv2 = srv2->next;
+				srv2 = proxy_next_server(srv2);
 			} while (srv2 &&
 				 !((srv2->flags & SRV_F_BACKUP) &&
 				   srv_willbe_usable(srv2)));
@@ -169,7 +170,7 @@ static void fas_set_server_status_up(struct server *srv)
 				 */
 				struct server *srv2 = srv;
 				do {
-					srv2 = srv2->next;
+					srv2 = proxy_next_server(srv2);
 				} while (srv2 && (srv2 != p->lbprm.fbck));
 				if (srv2)
 					p->lbprm.fbck = srv;
@@ -261,7 +262,7 @@ static int fas_init_server_tree(struct proxy *p)
 	struct eb_root init_head = EB_ROOT;
 
 	p->lbprm.wdiv = BE_WEIGHT_SCALE;
-	for (srv = p->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &p->servers, el_px) {
 		srv->next_eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
 		srv_lb_commit_status(srv);
 	}
@@ -273,7 +274,7 @@ static int fas_init_server_tree(struct proxy *p)
 	p->lbprm.fas.bck = init_head;
 
 	/* queue active and backup servers in two distinct groups */
-	for (srv = p->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &p->servers, el_px) {
 		if (!srv_currently_usable(srv))
 			continue;
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.fas.bck : &p->lbprm.fas.act;

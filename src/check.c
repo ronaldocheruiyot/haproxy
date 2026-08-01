@@ -1697,8 +1697,8 @@ static int start_checks()
 	 * a shorter interval will start independently and will not dictate
 	 * too short an interval for all others.
 	 */
-	for (px = proxies_list; px; px = px->next) {
-		for (s = px->srv; s; s = s->next) {
+	list_for_each_entry(px, &main_proxies, el) {
+		list_for_each_entry(s, &px->servers, el_px) {
 			if ((px->options2 & PR_O2_USE_SBUF_CHECK) &&
 			    (s->check.tcpcheck->rs && s->check.tcpcheck->rs->flags & TCPCHK_RULES_MAY_USE_SBUF))
 				s->check.state |= CHK_ST_USE_SMALL_BUFF;
@@ -1729,7 +1729,7 @@ static int start_checks()
 	 * by the number of servers, weighted by the server's position in the
 	 * list.
 	 */
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &main_proxies, el) {
 		if ((px->options2 & PR_O2_CHK_ANY) == PR_O2_EXT_CHK) {
 			if (init_pid_list()) {
 				ha_alert("Starting [%s] check: out of memory.\n", px->id);
@@ -1737,7 +1737,7 @@ static int start_checks()
 			}
 		}
 
-		for (s = px->srv; s; s = s->next) {
+		list_for_each_entry(s, &px->servers, el_px) {
 			/* A task for the main check */
 			if (s->check.state & CHK_ST_CONFIGURED) {
 				if (s->check.type == PR_O2_EXT_CHK) {

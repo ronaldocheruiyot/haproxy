@@ -539,9 +539,7 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 		if (promex_filter_metric(appctx, prefix, name))
 			continue;
 
-		if (!px)
-			px = proxies_list;
-
+		px = main_proxies_cond_first(px);
 		while (px) {
 			struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
 			enum promex_mt_type type;
@@ -618,7 +616,7 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 					    &val, labels, &out, max))
 				goto full;
 		  next_px:
-			px = px->next;
+			px = main_proxies_next(px);
 		}
 		ctx->flags |= PROMEX_FL_METRIC_HDR;
 	}
@@ -643,9 +641,7 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 			if (promex_filter_metric(appctx, prefix, name))
 				continue;
 
-			if (!px)
-				px = proxies_list;
-
+			px = main_proxies_cond_first(px);
 			while (px) {
 				struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
 				struct promex_metric metric;
@@ -680,7 +676,7 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 					goto full;
 
 			next_px2:
-				px = px->next;
+				px = main_proxies_next(px);
 			}
 			ctx->flags |= PROMEX_FL_METRIC_HDR;
 		}
@@ -739,9 +735,7 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 		if (promex_filter_metric(appctx, prefix, name))
 			continue;
 
-		if (!px)
-			px = proxies_list;
-
+		px = main_proxies_cond_first(px);
 		while (px) {
 			struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
 			int lb_idx = 0;
@@ -806,7 +800,7 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 			li = NULL;
 
 		  next_px:
-			px = px->next;
+			px = main_proxies_next(px);
 		}
 		ctx->flags |= PROMEX_FL_METRIC_HDR;
 	}
@@ -831,9 +825,7 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 			if (promex_filter_metric(appctx, prefix, name))
 				continue;
 
-			if (!px)
-				px = proxies_list;
-
+			px = main_proxies_cond_first(px);
 			while (px) {
 				struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
 				struct promex_metric metric;
@@ -879,7 +871,7 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 				li = NULL;
 
 			next_px2:
-				px = px->next;
+				px = main_proxies_next(px);
 			}
 			ctx->flags |= PROMEX_FL_METRIC_HDR;
 		}
@@ -974,13 +966,11 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 			switch (ctx->field_num) {
 				case ST_I_PX_AGG_SRV_CHECK_STATUS: // DEPRECATED
 				case ST_I_PX_AGG_SRV_STATUS:
-					if (!px->srv)
+					if (LIST_ISEMPTY(&px->servers))
 						goto next_px;
-					sv = px->srv;
-					while (sv) {
+					list_for_each_entry(sv, &px->servers, el_px) {
 						srv_state = promex_srv_status(sv);
 						srv_state_count[srv_state] += 1;
-						sv = sv->next;
 					}
 					for (; ctx->obj_state < PROMEX_SRV_STATE_COUNT; ctx->obj_state++) {
 						val = mkf_u32(FN_GAUGE, srv_state_count[ctx->obj_state]);
@@ -994,15 +984,13 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 					ctx->obj_state = 0;
 					goto next_px;
 				case ST_I_PX_AGG_CHECK_STATUS:
-					if (!px->srv)
+					if (LIST_ISEMPTY(&px->servers))
 						goto next_px;
-					sv = px->srv;
-					while (sv) {
+					list_for_each_entry(sv, &px->servers, el_px) {
 						if ((sv->check.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) {
 							srv_check_status = sv->check.status;
 							srv_check_count[srv_check_status] += 1;
 						}
-						sv = sv->next;
 					}
 					for (; ctx->obj_state < HCHK_STATUS_SIZE; ctx->obj_state++) {
 						if (get_check_status_result(ctx->obj_state) < CHK_RES_FAILED)
@@ -1019,7 +1007,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 					ctx->obj_state = 0;
 					goto next_px;
 				case ST_I_PX_STATUS:
-					bkd_state = ((px->lbprm.tot_weight > 0 || !px->srv) ? 1 : 0);
+					bkd_state = ((px->lbprm.tot_weight > 0 || LIST_ISEMPTY(&px->servers)) ? 1 : 0);
 					for (; ctx->obj_state < PROMEX_BACK_STATE_COUNT; ctx->obj_state++) {
 						labels[lb_idx].name = ist("state");
 						labels[lb_idx].value = promex_back_st[ctx->obj_state];
@@ -1097,7 +1085,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 					    &val, labels, &out, max))
 				goto full;
 		  next_px:
-			px = watcher_next(&ctx->px_watch, px->next);
+			px = watcher_next(&ctx->px_watch, main_proxies_next(px));
 		}
 		watcher_detach(&ctx->px_watch);
 		ctx->flags |= PROMEX_FL_METRIC_HDR;
@@ -1105,8 +1093,8 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 		/* Prepare a new iteration for the next stat column.
 		 * Update ctx.p[0] via watcher.
 		 */
-		watcher_attach(&ctx->px_watch, proxies_list);
-		px = proxies_list;
+		px = main_proxies_first();
+		watcher_attach(&ctx->px_watch, px);
 	}
 
 	/* Skip extra counters */
@@ -1163,7 +1151,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 					goto full;
 
 			next_px2:
-				px = watcher_next(&ctx->px_watch, px->next);
+				px = watcher_next(&ctx->px_watch, main_proxies_next(px));
 			}
 			watcher_detach(&ctx->px_watch);
 			ctx->flags |= PROMEX_FL_METRIC_HDR;
@@ -1171,8 +1159,8 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 			/* Prepare a new iteration for the next stat column.
 			 * Update ctx.p[0] via watcher.
 			 */
-			watcher_attach(&ctx->px_watch, proxies_list);
-			px = proxies_list;
+			px = main_proxies_first();
+			watcher_attach(&ctx->px_watch, px);
 		}
 
 		ctx->field_num += mod->stats_count;
@@ -1406,15 +1394,15 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 						    &val, labels, &out, max))
 					goto full;
 			  next_sv:
-				sv = watcher_next(&ctx->srv_watch, sv->next);
+				sv = watcher_next(&ctx->srv_watch, proxy_next_server(sv));
 			}
 
 		  next_px:
 			watcher_detach(&ctx->srv_watch);
-			px = watcher_next(&ctx->px_watch, px->next);
+			px = watcher_next(&ctx->px_watch, main_proxies_next(px));
 			if (px) {
 				/* Update ctx.p[1] via watcher. */
-				watcher_attach(&ctx->srv_watch, px->srv);
+				watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 				sv = ctx->p[1];
 			}
 		}
@@ -1424,10 +1412,10 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 		/* Prepare a new iteration for the next stat column.
 		 * Update ctx.p[0]/p[1] via px_watch/srv_watch.
 		 */
-		watcher_attach(&ctx->px_watch, proxies_list);
-		px = proxies_list;
+		px = main_proxies_first();
+		watcher_attach(&ctx->px_watch, px);
 		if (likely(px)) {
-			watcher_attach(&ctx->srv_watch, px->srv);
+			watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 			sv = ctx->p[1];
 		}
 	}
@@ -1494,15 +1482,15 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 						goto full;
 
 				  next_sv2:
-					sv = watcher_next(&ctx->srv_watch, sv->next);
+					sv = watcher_next(&ctx->srv_watch, proxy_next_server(sv));
 				}
 
 			  next_px2:
 				watcher_detach(&ctx->srv_watch);
-				px = watcher_next(&ctx->px_watch, px->next);
+				px = watcher_next(&ctx->px_watch, main_proxies_next(px));
 				if (px) {
 					/* Update ctx.p[1] via watcher. */
-					watcher_attach(&ctx->srv_watch, px->srv);
+					watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 					sv = ctx->p[1];
 				}
 			}
@@ -1512,10 +1500,10 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 			/* Prepare a new iteration for the next stat column.
 			 * Update ctx.p[0]/p[1] via px_watch/srv_watch.
 			 */
-			watcher_attach(&ctx->px_watch, proxies_list);
-			px = proxies_list;
+			px = main_proxies_first();
+			watcher_attach(&ctx->px_watch, px);
 			if (likely(px)) {
-				watcher_attach(&ctx->srv_watch, px->srv);
+				watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 				sv = ctx->p[1];
 			}
 		}
@@ -1711,6 +1699,7 @@ static int promex_dump_all_modules_metrics(struct appctx *appctx, struct htx *ht
 static int promex_dump_metrics(struct appctx *appctx, struct htx *htx)
 {
 	struct promex_ctx *ctx = appctx->svcctx;
+	struct proxy *px;
 	int ret;
 
 	switch (appctx->st1) {
@@ -1773,7 +1762,8 @@ static int promex_dump_metrics(struct appctx *appctx, struct htx *htx)
 
 			if (ctx->flags & PROMEX_FL_SCOPE_BACK) {
 				/* Update ctx.p[0] via watcher. */
-				watcher_attach(&ctx->px_watch, proxies_list);
+				px = main_proxies_first();
+				watcher_attach(&ctx->px_watch, px);
 			}
 			__fallthrough;
 
@@ -1795,10 +1785,11 @@ static int promex_dump_metrics(struct appctx *appctx, struct htx *htx)
 
 			if (ctx->flags & PROMEX_FL_SCOPE_SERVER) {
 				/* Update ctx.p[0] via watcher. */
-				watcher_attach(&ctx->px_watch, proxies_list);
-				if (likely(proxies_list)) {
+				px = main_proxies_first();
+				watcher_attach(&ctx->px_watch, px);
+				if (likely(px)) {
 					/* Update ctx.p[1] via watcher. */
-					watcher_attach(&ctx->srv_watch, proxies_list->srv);
+					watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 				}
 			}
 			__fallthrough;

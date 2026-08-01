@@ -72,6 +72,8 @@ enum {
 #define FD_EXCL_SYSCALL_BIT 21 /* a syscall claims exclusivity on this FD */
 #define FD_DISOWN_BIT      22  /* this fd will be closed by some external code */
 #define FD_MUST_CLOSE_BIT  23  /* this fd will be closed by some external code */
+#define FD_HAS_PORT_BIT    24  /* This fd had a port allocated from a port range */
+#define FD_OWNER_PR_BIT    27 /* The owner is actually a port range */
 
 
 /* and flag values */
@@ -114,6 +116,8 @@ enum {
 #define FD_EXCL_SYSCALL     (1U << FD_EXCL_SYSCALL_BIT)
 #define FD_DISOWN           (1U << FD_DISOWN_BIT)
 #define FD_MUST_CLOSE       (1U << FD_MUST_CLOSE_BIT)
+#define FD_HAS_PORT         (1U << FD_HAS_PORT_BIT)
+#define FD_OWNER_PR         (1U << FD_OWNER_PR_BIT)
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -210,12 +214,6 @@ struct polled_mask {
 	unsigned long poll_send;
 };
 
-/* less often used information */
-struct fdinfo {
-	struct port_range *port_range;       /* optional port range to bind to */
-	int local_port;                      /* optional local port */
-};
-
 /*
  * Poller descriptors.
  *  - <name> is initialized by the poller's register() function, and should not
@@ -233,6 +231,7 @@ struct fdinfo {
 
 #define HAP_POLL_F_RDHUP        0x00000001                   /* the poller notifies of HUP with reads */
 #define HAP_POLL_F_ERRHUP       0x00000002                   /* the poller reports ERR and HUP */
+#define HAP_POLL_F_NO_FD_SHARING 0x00000004                  /* the poller supports not sharing fds across thread groups */
 
 struct poller {
 	void   *private;                                     /* any private data for the poller */

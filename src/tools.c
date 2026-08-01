@@ -2036,8 +2036,9 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated.
+ * before <stop>. If bytes are missing between <start> and <stop>, if
+ * <truncate> is non zero, then the conversion will be incomplete and
+ * truncated. Otherwise an error is returned.
  * The input string must also be zero-terminated.
  *
  * Return the address of the \0 character, or NULL on error
@@ -2045,7 +2046,7 @@ int addr_is_local(const struct netns_entry *ns,
 const char hextab[16] __nonstring = "0123456789ABCDEF";
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
-		    const char *string)
+		    const char *string, int truncate)
 {
 	if (start < stop) {
 		stop--; /* reserve one byte for the final '\0' */
@@ -2053,8 +2054,11 @@ char *encode_string(char *start, char *stop,
 			if (!ha_bit_test((unsigned char)(*string), map))
 				*start++ = *string;
 			else {
-				if (start + 3 >= stop)
-					break;
+				if (start + 3 >= stop) {
+					if (truncate)
+						break;
+					goto error;
+				}
 				*start++ = escape;
 				*start++ = hextab[(*string >> 4) & 15];
 				*start++ = hextab[*string & 15];
@@ -2064,6 +2068,7 @@ char *encode_string(char *start, char *stop,
 		*start = '\0';
 		return start;
 	}
+  error:
 	return NULL;
 }
 
@@ -2072,8 +2077,8 @@ char *encode_string(char *start, char *stop,
  * <chunk> instead of a string.
  */
 char *encode_chunk(char *start, char *stop,
-		    const char escape, const long *map,
-		    const struct buffer *chunk)
+		   const char escape, const long *map,
+		   const struct buffer *chunk, int truncate)
 {
 	char *str = chunk->area;
 	char *end = chunk->area + chunk->data;
@@ -2084,8 +2089,11 @@ char *encode_chunk(char *start, char *stop,
 			if (!ha_bit_test((unsigned char)(*str), map))
 				*start++ = *str;
 			else {
-				if (start + 3 >= stop)
-					break;
+				if (start + 3 >= stop) {
+					if (truncate)
+						break;
+					goto error;
+				}
 				*start++ = escape;
 				*start++ = hextab[(*str >> 4) & 15];
 				*start++ = hextab[*str & 15];
@@ -2095,6 +2103,7 @@ char *encode_chunk(char *start, char *stop,
 		*start = '\0';
 		return start;
 	}
+  error:
 	return NULL;
 }
 
@@ -3892,6 +3901,72 @@ size_t ipaddrcpy(unsigned char *buf, const struct sockaddr_storage *saddr)
 	return p - buf;
 }
 
+/* cache of conversions from time_t to struct tm via localtime() and gmtime(). */
+static THREAD_LOCAL struct {
+	time_t sec;
+	struct tm tm;
+} localtime_cache[TIME_CACHE_SLOTS], gmtime_cache[TIME_CACHE_SLOTS];
+
+/* slot where most recent value was stored */
+static THREAD_LOCAL uint localtime_cache_slot, gmtime_cache_slot;
+
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function instead of localtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ * Also it implements a cache that avoids internal libc contention on tz_lock
+ * when entering __tz_convert().
+ */
+void get_localtime(const time_t now, struct tm *tm)
+{
+	uint32_t idx;
+
+	/* visit recent entries in age order */
+	idx = localtime_cache_slot;
+	do {
+		if (likely(localtime_cache[idx].sec == now)) {
+			/* that's a hit, return the cached entry */
+			*tm = localtime_cache[idx].tm;
+			return;
+		}
+		idx = (idx - 1) % TIME_CACHE_SLOTS;
+	} while (idx != localtime_cache_slot);
+
+	/* that's a miss, convert the time and cache it */
+	localtime_r(&now, tm);
+	localtime_cache_slot = (localtime_cache_slot + 1) % TIME_CACHE_SLOTS;
+	localtime_cache[localtime_cache_slot].sec = now;
+	localtime_cache[localtime_cache_slot].tm = *tm;
+}
+
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function instead of gmtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ * Also it implements a cache that avoids internal libc contention on tz_lock
+ * when entering __tz_convert().
+ */
+void get_gmtime(const time_t now, struct tm *tm)
+{
+	uint32_t idx;
+
+	/* visit recent entries in age order */
+	idx = gmtime_cache_slot;
+	do {
+		if (likely(gmtime_cache[idx].sec == now)) {
+			/* that's a hit, return the cached entry */
+			*tm = gmtime_cache[idx].tm;
+			return;
+		}
+		idx = (idx - 1) % TIME_CACHE_SLOTS;
+	} while (idx != gmtime_cache_slot);
+
+	/* that's a miss, convert the time and cache it */
+	gmtime_r(&now, tm);
+	gmtime_cache_slot = (gmtime_cache_slot + 1) % TIME_CACHE_SLOTS;
+	gmtime_cache[gmtime_cache_slot].sec = now;
+	gmtime_cache[gmtime_cache_slot].tm = *tm;
+}
 
 char *human_time(int t, short hz_div) {
 	static char rv[sizeof("24855d23h")+1];	// longest of "23h59m" and "59m59s"

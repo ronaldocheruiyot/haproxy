@@ -433,8 +433,9 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated.
+ * before <stop>. If bytes are missing between <start> and <stop>,  if
+ * <truncate> is non zero, then the conversion will be incomplete and
+ * truncated. Otherwise an error is returned.
  * The input string must also be zero-terminated.
  *
  * Return the address of the \0 character, or NULL on error
@@ -443,14 +444,14 @@ extern const char hextab[];
 extern long query_encode_map[];
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
-		    const char *string);
+		    const char *string, int truncate);
 
 /*
  * Same behavior, except that it encodes chunk <chunk> instead of a string.
  */
 char *encode_chunk(char *start, char *stop,
                    const char escape, const long *map,
-                   const struct buffer *chunk);
+                   const struct buffer *chunk, int truncate);
 
 /*
  * Tries to prefix characters tagged in the <map> with the <escape>
@@ -602,25 +603,8 @@ static inline char *alltrim(char *s, char c) {
 	return ltrim(s, c);
 }
 
-/* This function converts the time_t value <now> into a broken out struct tm
- * which must be allocated by the caller. It is highly recommended to use this
- * function instead of localtime() because that one requires a time_t* which
- * is not always compatible with tv_sec depending on OS/hardware combinations.
- */
-static inline void get_localtime(const time_t now, struct tm *tm)
-{
-	localtime_r(&now, tm);
-}
-
-/* This function converts the time_t value <now> into a broken out struct tm
- * which must be allocated by the caller. It is highly recommended to use this
- * function instead of gmtime() because that one requires a time_t* which
- * is not always compatible with tv_sec depending on OS/hardware combinations.
- */
-static inline void get_gmtime(const time_t now, struct tm *tm)
-{
-	gmtime_r(&now, tm);
-}
+void get_localtime(const time_t now, struct tm *tm);
+void get_gmtime(const time_t now, struct tm *tm);
 
 /* Counts a number of elapsed days since 01/01/0000 based solely on elapsed
  * years and assuming the regular rule for leap years applies. It's fake but

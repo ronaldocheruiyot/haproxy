@@ -1890,7 +1890,7 @@ int hlua_listable_servers_pairs_iterator(lua_State *L)
 
 	if (ctx->px) {
 		/* First iteration, initialize list on the first server */
-		cur = ctx->px->srv;
+		cur = proxy_first_server(ctx->px);
 		watcher_attach(&ctx->srv_watch, cur);
 		ctx->px = NULL;
 	}
@@ -1906,7 +1906,7 @@ int hlua_listable_servers_pairs_iterator(lua_State *L)
 	}
 
 	/* compute next server */
-	ctx->next = watcher_next(&ctx->srv_watch, cur->next);
+	ctx->next = watcher_next(&ctx->srv_watch, proxy_next_server(cur));
 
 	lua_pushstring(L, cur->id);
 	hlua_fcn_new_server(L, cur);
@@ -2379,10 +2379,10 @@ int hlua_listable_proxies_pairs_iterator(lua_State *L)
 	lua_pushstring(L, ctx->next->id);
 	hlua_fcn_new_proxy(L, ctx->next);
 
-	ctx->next = watcher_next(&ctx->px_watch, ctx->next->next);
+	ctx->next = watcher_next(&ctx->px_watch, main_proxies_next(ctx->next));
 	for (;
 	     ctx->next && !hlua_listable_proxies_match(ctx->next, ctx->capabilities);
-	     ctx->next = watcher_next(&ctx->px_watch, ctx->next->next))
+	     ctx->next = watcher_next(&ctx->px_watch, main_proxies_next(ctx->next)))
 		;
 
 	return 2;
@@ -2426,9 +2426,9 @@ int hlua_listable_proxies_pairs(lua_State *L)
 	ctx->next = NULL;
 	watcher_init(&ctx->px_watch, &ctx->next, offsetof(struct proxy, watcher_list));
 
-	for (watcher_attach(&ctx->px_watch, proxies_list);
+	for (watcher_attach(&ctx->px_watch, main_proxies_first());
 	     ctx->next && !hlua_listable_proxies_match(ctx->next, ctx->capabilities);
-	     ctx->next = watcher_next(&ctx->px_watch, ctx->next->next))
+	     ctx->next = watcher_next(&ctx->px_watch, main_proxies_next(ctx->next)))
 		;
 
 	lua_pushcclosure(L, hlua_listable_proxies_pairs_iterator, 1);

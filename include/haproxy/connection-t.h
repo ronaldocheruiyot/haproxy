@@ -303,6 +303,7 @@ enum {
 	CO_ER_ENSOCK,            /* ENSOCK returned to recv/send */
 	CO_ER_ENOBUFS,           /* ENOBUFS returned to send */
 	CO_ER_EPIPE,             /* EPIPE returned to send */
+	CO_ER_SSL_KEYUPDATE,     /* too many TLS1.3 KeyUpdate messages */
 };
 
 /* error return codes for accept_conn() */

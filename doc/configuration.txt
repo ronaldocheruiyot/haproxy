@@ -1891,6 +1891,7 @@ The following keywords are supported in the "global" section :
    - tune.events.max-events-at-once
    - tune.fail-alloc
    - tune.fd.edge-triggered
+   - tune.fd.tables
    - tune.h1.be.glitches-threshold
    - tune.h1.fe.glitches-threshold
    - tune.h1.zero-copy-fwd-recv
@@ -1993,6 +1994,7 @@ The following keywords are supported in the "global" section :
    - tune.ssl.force-private-cache
    - tune.ssl.hard-maxrecord
    - tune.ssl.keylog
+   - tune.ssl.keyupdate-rate-limit
    - tune.ssl.lifetime
    - tune.ssl.maxrecord
    - tune.ssl.ssl-ctx-cache-size
@@ -4305,6 +4307,14 @@ tune.fd.edge-triggered { on | off }  [ EXPERIMENTAL ]
   certain scenarios. This is still experimental, it may result in frozen
   connections if bugs are still present, and is disabled by default.
 
+tune.fd.tables { shared | per-thread-group }  [ EXPERIMENTAL ]
+  Decide if the file descriptor tables are shared by everybody (shared), or
+  if there is one per thread group (per-thread-group). Having one table per
+  thread group can give a good performance boost with enough threads and
+  thread groups, as there is a lot of contention on the kernel file descriptor
+  tables.
+  The default is "shared".
+
 tune.glitches.kill.cpu-usage <number>
   Sets the minimum CPU usage between 0 and 100, at which connections showing
   too many glitches will be killed. This applies to connections that have
@@ -5565,6 +5575,12 @@ tune.ssl.keylog { on | off }
     $HAPROXY_KEYLOG_FC_LOG_FMT   frontend (client-facing) connection keys
     $HAPROXY_KEYLOG_BC_LOG_FMT   backend (server-facing) connection keys
 
+tune.ssl.keyupdate-rate-limit <limit>
+  Limit the amount of KeyUpdate per second we're willing to accept to <limit>
+  before considering it flood, and killing the connection. Dealing with
+  KeyUpdate is cpu-expensive, and there is little reason to receive a lot of
+  them. Using a value of "0" disables the rate limiting.
+  The default value is 100.
 tune.ssl.lifetime <timeout>
   Sets how long a cached SSL session may remain valid. This time is expressed
   in seconds and defaults to 300 (5 min). It is important to understand that it

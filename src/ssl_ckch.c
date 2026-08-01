@@ -1720,15 +1720,15 @@ static int cli_io_handler_show_sni(struct appctx *appctx)
 		return 1;
 
 	/* ctx->bind is NULL only once we finished dumping a frontend or when starting
-	 * so let's dump the header in these cases*/
+	 * so let's dump the header in these cases.
+	 */
 	if (ctx->bind == NULL && (ctx->options & SHOW_SNI_OPT_1FRONTEND ||
-	    (!(ctx->options & SHOW_SNI_OPT_1FRONTEND) && ctx->px == proxies_list)))
+	    (!(ctx->options & SHOW_SNI_OPT_1FRONTEND) && ctx->px == main_proxies_first())))
 		chunk_appendf(trash, "# Frontend/Bind\tSNI\tNegative Filter\tType\tFilename\tNotAfter\tNotBefore\n");
 	if (applet_putchk(appctx, trash) == -1)
 		goto yield;
 
-	for (px = ctx->px; px; px = px->next) {
-
+	for (px = ctx->px; px; px = main_proxies_next(px)) {
 		/* only check the frontends which are not internal proxies */
 		if (!(px->cap & PR_CAP_FE) || (px->cap & PR_CAP_INT))
 			continue;
@@ -1851,7 +1851,7 @@ static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx,
 	struct show_sni_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	int cur_arg = 3;
 
-	ctx->px = proxies_list;
+	ctx->px = main_proxies_first();
 
 	/* look for the right <frontend> to display */
 
@@ -1863,7 +1863,7 @@ static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx,
 			if (*args[cur_arg+1] == '\0')
 				return cli_err(appctx, "'-f' requires a frontend name!\n");
 
-			for (px = proxies_list; px; px = px->next) {
+			list_for_each_entry(px, &main_proxies, el) {
 
 				/* only check the frontends */
 				if (!(px->cap & PR_CAP_FE))

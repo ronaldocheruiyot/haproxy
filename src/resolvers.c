@@ -2680,7 +2680,16 @@ static void resolvers_destroy(struct resolvers *resolvers)
 		free(ns->id);
 		free((char *)ns->conf.file);
 		if (ns->dgram) {
-			if (ns->dgram->conn.t.sock.fd != -1) {
+			/* with per-thread-group FD tables, the socket belongs
+			 * to the group of the resolvers task's thread; if it
+			 * is not ours, it was already closed by the kernel
+			 * when the last thread of that group exited, and its
+			 * number is not valid in this thread's tables.
+			 */
+			if (ns->dgram->conn.t.sock.fd != -1 &&
+			    (!(global.tune.options & GTUNE_NO_TG_FD_SHARING) ||
+			     (resolvers->t &&
+			      ha_thread_info[resolvers->t->tid].tgid == tgid))) {
 				fd_delete(ns->dgram->conn.t.sock.fd);
 				close(ns->dgram->conn.t.sock.fd);
 			}
@@ -2805,10 +2814,25 @@ static int resolvers_finalize_config(void)
 		t->process   = process_resolvers;
 		t->context   = resolvers;
 		resolvers->t = t;
+
+		/*
+		 * Make sure we run those tasks on the same thread that
+		 * takes care of those resolvers, as it will create the
+		 * socket, and with separate file descriptors tables for
+		 * each thread group, we want to make sure we will
+		 * run on a thread that can actually use them.
+		 */
+		list_for_each_entry(ns, &resolvers->nameservers, list) {
+			if (ns->stream) {
+				task_set_thread(ns->stream->task_req, t->tid);
+				task_set_thread(ns->stream->task_rsp, t->tid);
+				task_set_thread(ns->stream->task_idle, t->tid);
+			}
+		}
 		task_wakeup(t, TASK_WOKEN_INIT);
 	}
 
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &main_proxies, el) {
 		struct server *srv;
 
 		if (px->flags & PR_FL_DISABLED) {
@@ -2818,7 +2842,7 @@ static int resolvers_finalize_config(void)
 			continue;
 		}
 
-		for (srv = px->srv; srv; srv = srv->next) {
+		list_for_each_entry(srv, &px->servers, el_px) {
 			struct resolvers *resolvers;
 
 			if (!srv->resolvers_id)
@@ -3780,7 +3804,7 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
-			if (dns_stream_init(newnameserver, curr_resolvers->px->srv) < 0) {
+			if (dns_stream_init(newnameserver, proxy_first_server(curr_resolvers->px)) < 0) {
 				ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
 				err_code |= ERR_ALERT|ERR_ABORT;
 				free(newnameserver);
@@ -4064,8 +4088,7 @@ static int cfg_post_check_resolvers(void)
 	list_for_each_entry(r, &sec_resolvers, list) {
 		/* prepare forward server descriptors */
 		if (r->px) {
-			srv = r->px->srv;
-			while (srv) {
+			list_for_each_entry(srv, &r->px->servers, el_px) {
 				/* init ssl if needed */
 				if (srv->use_ssl == 1 && xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
 					if (xprt_get(XPRT_SSL)->prepare_srv(srv)) {
@@ -4074,7 +4097,6 @@ static int cfg_post_check_resolvers(void)
 						break;
 					}
 				}
-				srv = srv->next;
 			}
 		}
 	}

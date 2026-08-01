@@ -340,14 +340,13 @@ static int sample_conv_url_enc(const struct arg *args, struct sample *smp, void
 		*private)
 {
 	enum encode_type enc_type;
-	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
+	struct buffer *chk = get_trash_chunk_sz(smp->data.u.str.data);
 	long *encode_map;
 	char *ret;
 
-	if (!trash)
+	if (!chk)
 		return 0;
 
-	enc_type = ENC_QUERY;
 	enc_type = args->data.sint;
 
 	if (enc_type == ENC_QUERY)
@@ -355,12 +354,12 @@ static int sample_conv_url_enc(const struct arg *args, struct sample *smp, void
 	else
 		return 0;
 
-	ret = encode_chunk(trash->area, trash->area + trash->size, '%',
-			   encode_map, &smp->data.u.str);
+	ret = encode_chunk(chk->area, chk->area + chk->size, '%',
+			   encode_map, &smp->data.u.str, 0);
 	if (ret == NULL || *ret != '\0')
 		return 0;
-	trash->data = ret - trash->area;
-	smp->data.u.str = *trash;
+	chk->data = ret - chk->area;
+	smp->data.u.str = *chk;
 	return 1;
 }
 
@@ -402,9 +401,12 @@ static int smp_conv_req_capture(const struct arg *args, struct sample *smp, void
 	if (len > hdr->len)
 		len = hdr->len;
 
-	/* Capture input data. */
-	memcpy(smp->strm->req_cap[idx], smp->data.u.str.area, len);
-	smp->strm->req_cap[idx][len] = '\0';
+	/* Capture input data. Use hdr->index and not idx: while both are equal
+	 * for a properly built capture list, only the former is guaranteed to
+	 * be a valid slot number for the array allocated above.
+	 */
+	memcpy(smp->strm->req_cap[hdr->index], smp->data.u.str.area, len);
+	smp->strm->req_cap[hdr->index][len] = '\0';
 
 	return 1;
 }
@@ -447,9 +449,12 @@ static int smp_conv_res_capture(const struct arg *args, struct sample *smp, void
 	if (len > hdr->len)
 		len = hdr->len;
 
-	/* Capture input data. */
-	memcpy(smp->strm->res_cap[idx], smp->data.u.str.area, len);
-	smp->strm->res_cap[idx][len] = '\0';
+	/* Capture input data. Use hdr->index and not idx: while both are equal
+	 * for a properly built capture list, only the former is guaranteed to
+	 * be a valid slot number for the array allocated above.
+	 */
+	memcpy(smp->strm->res_cap[hdr->index], smp->data.u.str.area, len);
+	smp->strm->res_cap[hdr->index][len] = '\0';
 
 	return 1;
 }

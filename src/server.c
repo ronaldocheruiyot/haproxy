@@ -47,6 +47,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/stats-proxy.h>
 #include <haproxy/stats.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
@@ -78,7 +79,7 @@ struct srv_kw_list srv_keywords = {
 
 struct eb_root idle_conn_srv[MAX_THREADS];
 struct task *idle_conn_task[MAX_THREADS] __read_mostly = {};
-struct mt_list servers_list = MT_LIST_HEAD_INIT(servers_list);
+struct mt_list all_servers = MT_LIST_HEAD_INIT(all_servers);
 static struct task *server_atomic_sync_task = NULL;
 static event_hdl_async_equeue server_atomic_sync_queue;
 
@@ -550,8 +551,7 @@ static inline void srv_check_for_dup_dyncookie(struct server *s)
 	struct proxy *p = s->proxy;
 	struct server *tmpserv;
 
-	for (tmpserv = p->srv; tmpserv != NULL;
-	    tmpserv = tmpserv->next) {
+	list_for_each_entry(tmpserv, &p->servers, el_px) {
 		if (tmpserv == s)
 			continue;
 		if (tmpserv->next_admin & SRV_ADMF_FMAINT)
@@ -2135,9 +2135,10 @@ void srv_shutdown_backup_streams(struct proxy *px, int why)
 {
 	struct server *srv;
 
-	for (srv = px->srv; srv != NULL; srv = srv->next)
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->flags & SRV_F_BACKUP)
 			srv_shutdown_streams(srv, why);
+	}
 }
 
 static void srv_append_op_chg_cause(struct buffer *msg, struct server *s, enum srv_op_st_chg_cause cause)
@@ -2393,7 +2394,7 @@ void srv_compute_all_admin_states(struct proxy *px)
 {
 	struct server *srv;
 
-	for (srv = px->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->track)
 			continue;
 		srv_propagate_admin_state(srv);
@@ -2890,6 +2891,8 @@ void srv_settings_init(struct server *srv)
 	srv->check.rise = DEF_RISETIME;
 	srv->check.fall = DEF_FALLTIME;
 	srv->check.port = 0;
+	/* Automatically activate check-reuse-pool for rhttp@ servers. */
+	srv->check.reuse_pool = srv->flags & SRV_F_RHTTP ? 1 : 0;
 
 	srv->agent.inter = DEF_CHKINTR;
 	srv->agent.fastinter = 0;
@@ -2953,6 +2956,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 		srv->addr = src->addr;
 		srv->addr_type = src->addr_type;
 		srv->svc_port = src->svc_port;
+		srv->alt_proto = src->alt_proto;
 	}
 
 	srv->pp_opts = src->pp_opts;
@@ -2997,8 +3001,12 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 			srv->check.tcpcheck = tcpcheck;
 	}
 
-	if (!(srv->flags & SRV_F_RHTTP))
-		srv->check.reuse_pool = src->check.reuse_pool;
+	/* For rHTTP check-reuse-pool is forcefully set. Duplicate the source
+	 * value in other cases as expected.
+	 */
+	srv->check.reuse_pool = srv->flags & SRV_F_RHTTP ?
+	                        1 : src->check.reuse_pool;
+
 	if (src->check.pool_conn_name)
 		srv->check.pool_conn_name = strdup(src->check.pool_conn_name);
 	/* Note: 'flags' field has potentially been already initialized. */
@@ -3135,7 +3143,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	}
 }
 
-/* Allocates a server, attaches it to the global servers_list
+/* Allocates a server, attaches it to the global <all_servers> list
  * and adds it to <proxy> server list. Before deleting the server with
  * srv_drop(), srv_detach() must be called to remove it from the parent
  * proxy list
@@ -3154,7 +3162,8 @@ struct server *new_server(struct proxy *proxy)
 
 	srv->obj_type = OBJ_TYPE_SERVER;
 	srv->proxy = proxy;
-	MT_LIST_APPEND(&servers_list, &srv->global_list);
+	LIST_APPEND(&proxy->servers, &srv->el_px);
+	MT_LIST_APPEND(&all_servers, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
 	LIST_INIT(&srv->pp_tlvs);
@@ -3183,24 +3192,6 @@ struct server *new_server(struct proxy *proxy)
 #ifdef USE_OPENSSL
 	HA_RWLOCK_INIT(&srv->ssl_ctx.lock);
 #endif
-
-	// add server to proxy list:
-	/* TODO use a double-linked list for px->srv */
-	if (!(proxy->flags & PR_FL_CHECKED) || !proxy->srv) {
-		/* they are linked backwards first during parsing
-		 * This will be restablished after parsing.
-		 */
-		srv->next = proxy->srv;
-		proxy->srv = srv;
-	}
-	else {
-		struct server *sv = proxy->srv;
-
-		// runtime, add the server at the end of the list
-		while (sv && sv->next)
-			sv = sv->next;
-		sv->next = srv;
-	}
 
 	HA_RWLOCK_INIT(&srv->path_params.param_lock);
 
@@ -3260,20 +3251,14 @@ void srv_free_params(struct server *srv)
  *
  * A general rule is to assume that proxy may already be freed, so cleanup checks
  * must not depend on the proxy
- *
- * As a convenience, <srv.next> is returned if srv is not NULL. It may be useful
- * when calling srv_drop on the list of servers.
  */
-struct server *srv_drop(struct server *srv)
+void srv_drop(struct server *srv)
 {
-	struct server *next = NULL;
 	struct proxy *px = NULL;
 	int i __maybe_unused;
 
 	if (!srv)
-		goto end;
-
-	next = srv->next;
+		return;
 
 	/* If srv was deleted, a proxy refcount must be dropped. */
 	if (srv->flags & SRV_F_DELETED)
@@ -3283,7 +3268,7 @@ struct server *srv_drop(struct server *srv)
 	 * server when reaching zero.
 	 */
 	if (HA_ATOMIC_SUB_FETCH(&srv->refcount, 1))
-		goto end;
+		return;
 
 	/* This BUG_ON() is invalid for now as server released on deinit will
 	 * trigger it as they are not properly removed from their tree.
@@ -3322,9 +3307,6 @@ struct server *srv_drop(struct server *srv)
 	srv_free(&srv);
 
 	proxy_drop(px);
-
- end:
-	return next;
 }
 
 /* Remove a server <srv> from a tracking list if <srv> is tracking another
@@ -3804,10 +3786,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-
-			mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
-			newsrv->xprt = xprt_get(XPRT_QUIC);
-			quic_transport_params_init(&newsrv->quic_params, 0);
 		}
 #else
 		if (srv_is_quic(newsrv)) {
@@ -3826,8 +3804,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			}
 			else {
 				newsrv->flags |= SRV_F_RHTTP;
-				/* Automatically activate check-reuse-pool for rhttp@ servers. */
-				newsrv->check.reuse_pool = 1;
 			}
 		}
 
@@ -5203,7 +5179,7 @@ struct server *snr_check_ip_callback(struct server *srv, void *ip, unsigned char
 		return NULL;
 
 	be = srv->proxy;
-	for (tmpsrv = be->srv; tmpsrv; tmpsrv = tmpsrv->next) {
+	list_for_each_entry(tmpsrv, &be->servers, el_px) {
 		/* we found the current server is the same, ignore it */
 		if (srv == tmpsrv)
 			continue;
@@ -5462,23 +5438,19 @@ int srv_init_addr(void)
 	struct proxy *curproxy;
 	int return_code = 0;
 
-	curproxy = proxies_list;
-	while (curproxy) {
+	list_for_each_entry(curproxy, &main_proxies, el) {
 		struct server *srv;
 
 		/* servers are in backend only */
 		if (!(curproxy->cap & PR_CAP_BE) || (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
-			goto srv_init_addr_next;
+			continue;
 
-		for (srv = curproxy->srv; srv; srv = srv->next) {
+		list_for_each_entry(srv, &curproxy->servers, el_px) {
 			set_usermsgs_ctx(srv->conf.file, srv->conf.line, &srv->obj_type);
 			if (srv->hostname || srv->srvrq)
 				return_code |= srv_iterate_initaddr(srv);
 			reset_usermsgs_ctx();
 		}
-
- srv_init_addr_next:
-		curproxy = curproxy->next;
 	}
 
 	return return_code;
@@ -6712,7 +6684,7 @@ leave:
 static int cli_parse_delete_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct proxy *be;
-	struct server *srv;
+	struct server *srv, *next;
 	struct ist be_name, sv_name;
 	struct watcher *srv_watch;
 	const char *msg;
@@ -6763,10 +6735,11 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_deinit)
 		srv->proxy->lbprm.ops->server_deinit(srv);
 
+	next = proxy_next_server(srv);
+	BUG_ON(next && next->flags & SRV_F_DELETED);
 	while (!MT_LIST_ISEMPTY(&srv->watcher_list)) {
 		srv_watch = MT_LIST_NEXT(&srv->watcher_list, struct watcher *, el);
-		BUG_ON(srv->next && srv->next->flags & SRV_F_DELETED);
-		watcher_next(srv_watch, srv->next);
+		watcher_next(srv_watch, next);
 	}
 
 	/* detach the server from the proxy linked list
@@ -6807,6 +6780,58 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 out:
 	thread_release();
+	return 1;
+}
+
+/* Reset the statistics counters of a single server, invoked from the
+ * "clear counters server <backend>/<server> [force]" CLI command (dispatched
+ * by cli_parse_clear_counters() in stats.c, since "clear counters" is a
+ * two-word keyword that would otherwise shadow a three-word variant).
+ *
+ * The command is not gated by the server's administrative state: like
+ * "clear counters" / "clear counters all", it only zeroes counter values
+ * and does not touch the server object or its runtime state, so it is safe
+ * to issue on a live server (a concurrent counter increment races on a
+ * value exactly as it already does for "clear counters all"). This is
+ * useful when a server slot is being reused to represent a different
+ * logical entity (e.g. a different Kubernetes pod occupying the same slot
+ * after a rename) and per-entity counter attribution is required.
+ *
+ * When the server's counters are registered in a shared-memory stats file
+ * object (COUNTERS_SHARED_F_LOCAL not set), clearing them breaks the
+ * monotonicity that monitoring tools consuming the shared stats rely on,
+ * and affects every process attached to the object. Such a clear is
+ * therefore refused unless <force> is set.
+ *
+ * <arg> is the "<backend>/<server>" argument. Always returns 1 (the CLI
+ * parser convention for "message emitted, stop"); success or error is
+ * reported to <appctx>.
+ */
+int cli_clear_counters_server(struct appctx *appctx, char *arg, int force)
+{
+	struct server *sv;
+
+	sv = cli_find_server(appctx, arg);
+	if (!sv)
+		return 1;
+
+	if (!force && !(sv->counters.shared.flags & COUNTERS_SHARED_F_LOCAL)) {
+		cli_err(appctx,
+		        "Server counters are stored in a shared-memory stats "
+		        "file; clearing them breaks monotonicity for monitoring "
+		        "tools and affects all attached processes. Append 'force' "
+		        "to clear anyway.\n");
+		return 1;
+	}
+
+	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
+
+	counters_be_reset(&sv->counters);
+	srv_stats_clear_extra_counters(sv);
+
+	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
+
+	cli_msg(appctx, LOG_NOTICE, "Server counters cleared.\n");
 	return 1;
 }
 
@@ -7822,7 +7847,15 @@ static void srv_close_idle_conns(struct server *srv)
 		for (cleaned_tree = conn_trees; *cleaned_tree; ++cleaned_tree) {
 			while ((conn = ceb64_item_first(*cleaned_tree, hash_node.node,
 							hash_node.key, struct connection))) {
-				if (conn->ctrl->ctrl_close)
+				/*
+				 * Make sure we only close our own fds. If the
+				 * connection was owned by another thread group,
+				 * it should be closed already as all those
+				 * threads exited already.
+				 */
+				if (conn->ctrl->ctrl_close &&
+				    (!(global.tune.options & GTUNE_NO_TG_FD_SHARING) ||
+				     ha_thread_info[i].tgid == tgid))
 					conn->ctrl->ctrl_close(conn);
 				conn_delete_from_tree(conn, i);
 			}

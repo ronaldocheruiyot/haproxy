@@ -44,7 +44,7 @@
 extern struct idle_conns idle_conns[MAX_THREADS];
 extern struct task *idle_conn_task[MAX_THREADS];
 extern struct eb_root idle_conn_srv[MAX_THREADS];
-extern struct mt_list servers_list;
+extern struct mt_list all_servers;
 extern struct dict server_key_dict;
 
 int srv_downtime(const struct server *s);
@@ -77,9 +77,10 @@ int srv_set_addr_via_libc(struct server *srv, int *err_code);
 int srv_postinit(struct server *srv);
 int srv_init_addr(void);
 struct server *cli_find_server(struct appctx *appctx, char *arg);
+int cli_clear_counters_server(struct appctx *appctx, char *arg, int force);
 struct server *new_server(struct proxy *proxy);
 void srv_take(struct server *srv);
-struct server *srv_drop(struct server *srv);
+void srv_drop(struct server *srv);
 void srv_free_params(struct server *srv);
 int srv_preinit(struct server *srv);
 int srv_set_ssl(struct server *s, int use_ssl);
@@ -395,18 +396,8 @@ static inline int srv_is_transparent(const struct server *srv)
 static inline void srv_detach(struct server *srv)
 {
 	struct proxy *px = srv->proxy;
-	struct server *prev;
 
-	if (px->srv == srv) {
-		px->srv = srv->next;
-	}
-	else {
-		for (prev = px->srv; prev && prev->next != srv; prev = prev->next)
-			;
-		BUG_ON(!prev); /* Server instance not found in proxy list ? */
-		prev->next = srv->next;
-	}
-
+	LIST_DEL_INIT(&srv->el_px);
 	/* Reset the proxy's ready_srv if it was this one. */
 	HA_ATOMIC_CAS(&px->ready_srv, &srv, NULL);
 }

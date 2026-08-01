@@ -23,12 +23,14 @@ static void  hld_usage(char *name, int argc)
 		"        -e               stop upon first connection error\n"
 		"        -h(0|1|2|2c|3)   use h0 (hq-interop for QUIC), h1, h2, h2c or h3 (QUIC/TCP) protocols (*)\n"
 		"        -(0|1|2|2c|3)    same as above (*)\n"
+		"        -hs              show HTTP status codes distribution\n"
+		"        -hsv             show HTTP status codes distribution ((global + per HTTP version)\n"
 		"        -l               enable long output format; double for raw values\n"
 		"        -m <streams>     maximum concurrent streams (1)\n"
 		"        -n <reqs>        maximum total requests (-1)\n"
 		"        -r <reqs>        number of requests per connection (-1)\n"
 		"        -s <time>        soft start: time in sec to reach 100%% load\n"
-		"        -t <threads>     number of threads\n"
+		"        -t <threads>     force number of threads (nbthread)\n"
 		"        -u <users>       number of users (1)\n"
 		"        -w <time>        I/O timeout in milliseconds (10000)\n"
 		"        -A               ignore 1st req for resp time measurements\n"
@@ -36,11 +38,11 @@ static void  hld_usage(char *name, int argc)
 		"        -F               merge send() with connect's ACK\n"
 		"        -H \"foo:bar\"   add this header name and value\n"
 		"        -I               use HEAD instead of GET\n"
+		"        -R <rate>        limit to this many request attempts per second (0)\n"
 		"        -v               shows version\n"
 		"        --defaults <str> add a string to default section\n"
 		"        --global <str>   add a string to global section\n"
 		"        --server <opts>  set server <opt> options as defined for \"server\" haproxy keyword\n"
-		"        --show-status-codes show HTTP status codes distribution\n"
 		"        --traces         enable the traces for all the HTTP protocols\n"
 		"SSL options:\n"
 		"        --tls-ciphers <ciphers>       for TLS1.2 and below (*)\n"
@@ -49,7 +51,8 @@ static void  hld_usage(char *name, int argc)
 		"URL format:\n"
 		"        (http|https|quic)://<addr>:<port>/<path>\n"
 		"Note: Options marked with an asterisk (*) are positional and MUST be placed\n"
-		"      BEFORE the URLs they are intended to affect.\n",
+		"      BEFORE the URLs they are intended to affect.\n"
+		"Note: When <arg_rate> is set, <arg_thrd> must be lesser or equal to <arg_usr>\n",
 		name);
 	exit(1);
 }
@@ -179,9 +182,11 @@ int hld_url_cfg_path_exist(struct hld_url_cfg *u, const char *path)
  * of paths attaached to the URL.
  * Return the URL if succeeded, NULL if not.
  */
-static struct hld_url_cfg *hld_alloc_url(char *url)
+static struct hld_url_cfg *hld_alloc_url(char *url, int is_quic,
+                                         char *alpn_param, int h2c_param,
+                                         enum hld_http_ver http_ver)
 {
-	int ssl = 0, is_quic = 0;
+	int ssl = 0;
 	char *addr = NULL, *raw_addr = NULL, *path = NULL;
 	struct hld_url_cfg *hld_url_cfg = NULL;
 	struct hld_url_cfg *purl;
@@ -200,11 +205,10 @@ static struct hld_url_cfg *hld_alloc_url(char *url)
 		addr = url + 8;
 #endif
 	}
-	else if (strncmp(url, "quic://",  7) == 0) {
+	else if (is_quic) {
 #if defined(USE_QUIC)
 		ssl = 1;
 		addr = url + 7;
-		is_quic = 1;
 #else
 		ha_warning("QUIC support not compiled in. Rebuild with USE_QUIC=1.\n");
 		goto err;
@@ -227,7 +231,10 @@ static struct hld_url_cfg *hld_alloc_url(char *url)
 
 	for (purl = hld_url_cfgs; purl; purl = purl->next) {
 		if (purl->is_quic == is_quic && purl->ssl == ssl &&
-		    strcmp(purl->raw_addr, addr) == 0 && strcmp(purl->alpn, alpn) == 0) {
+		    purl->h2c == h2c_param &&
+		    strcmp(purl->raw_addr, addr) == 0 &&
+		    ((!purl->alpn && !alpn_param) ||
+		     (purl->alpn && alpn_param && strcmp(purl->alpn, alpn_param) == 0))) {
 			if (hld_url_cfg_path_exist(purl, path)) {
 				free(path);
 				ha_warning("'%s' URL already exists. Skipped...\n", url);
@@ -282,11 +289,12 @@ static struct hld_url_cfg *hld_alloc_url(char *url)
 
 	hld_url_cfg->ssl = ssl;
 	hld_url_cfg->is_quic = is_quic;
-	hld_url_cfg->h2c = h2c;
+	hld_url_cfg->h2c = h2c_param;
+	hld_url_cfg->http_ver = http_ver;
 	hld_url_cfg->addr = addr;
 	hld_url_cfg->raw_addr = raw_addr;
-	if (alpn) {
-		hld_url_cfg->alpn = strdup(alpn);
+	if (alpn_param) {
+		hld_url_cfg->alpn = strdup(alpn_param);
 		if (!hld_url_cfg->alpn) {
 			ha_warning("Could not allocate alpn.\n");
 			goto err;
@@ -311,8 +319,8 @@ static struct hld_url_cfg *hld_alloc_url(char *url)
 	    !hld_add_opt_to_buf(&opts_buf, "curves", tls_curves))
 		goto err;
 
-	if (alpn && !h2c &&
-	    !hld_add_opt_to_buf(&opts_buf, "alpn", alpn))
+	if (alpn_param && !h2c_param &&
+	    !hld_add_opt_to_buf(&opts_buf, "alpn", alpn_param))
 		goto err;
 
 	if (!hbuf_is_null(&opts_buf))
@@ -390,6 +398,7 @@ void haproxy_init_args(int argc, char **argv)
 	struct hbuf gbuf = HBUF_NULL; // "global" section
 	struct hbuf tbuf = HBUF_NULL; // "traces" section
 	struct hbuf dbuf = HBUF_NULL; // "default" section
+	int http_ver = HLD_HTTP_VER_1;
 
 	if (argc <= 1)
 		hld_usage(progname, argc);
@@ -417,6 +426,7 @@ void haproxy_init_args(int argc, char **argv)
 	argc--; argv++;
 
 	while (argc > 0) {
+
 		if (**argv == '-') {
 			char *opt = *argv + 1;
 
@@ -455,9 +465,6 @@ void haproxy_init_args(int argc, char **argv)
 					free(srv_opts);
 					srv_opts = strdup(opt);
 				}
-				else if (strcmp(opt, "show-status-codes") == 0) {
-					arg_hscd = 1;
-				}
 				else if (strcmp(opt, "tls-ciphers") == 0) {
 					argv++, argc--;
 					if ((argc <= 0 || **argv == '-'))
@@ -492,27 +499,32 @@ void haproxy_init_args(int argc, char **argv)
 			         strcmp(opt, "h0") == 0) {
 				alpn = "hq-interop";
 				h2c = 0;
+				http_ver = HLD_HTTP_VER_0;
 			}
 			else if (strcmp(opt, "1") == 0 ||
 			         strcmp(opt, "h1") == 0) {
 				alpn = "http/1.1";
 				h2c = 0;
+				http_ver = HLD_HTTP_VER_1;
 			}
 			else if (strcmp(opt, "2") == 0 ||
 			         strcmp(opt, "h2") == 0) {
 				alpn = "h2";
 				h2c = 0;
+				http_ver = HLD_HTTP_VER_2;
 			}
 			else if (strcmp(opt, "2c") == 0 ||
 			         strcmp(opt, "h2c") == 0) {
 				alpn = NULL;
 				h2c = 1;
+				http_ver = HLD_HTTP_VER_2;
 			}
 			else if (strcmp(opt, "3") == 0 ||
 			         strcmp(opt, "h3") == 0) {
 #if defined(USE_QUIC)
 				alpn = "h3";
 				h2c = 0;
+				http_ver = HLD_HTTP_VER_3;
 #else
 				ha_warning("QUIC support not compiled in. Rebuild with USE_QUIC=1.\n");
 				goto leave;
@@ -528,6 +540,12 @@ void haproxy_init_args(int argc, char **argv)
 					hld_usage(progname, argc);
 
 				arg_serr = 1;
+			}
+			else if (strcmp(opt, "hs") == 0) {
+				arg_hscd = 1;
+			}
+			else if (strcmp(opt, "hsv") == 0) {
+				arg_hscd = 2;
 			}
 			else if (*opt == 'l') {
 				arg_long++;
@@ -613,6 +631,10 @@ void haproxy_init_args(int argc, char **argv)
 
 				arg_head = 1;
 			}
+			else if (*opt == 'R') {
+				opt++;
+				hld_parse_long(&arg_rate, opt, &argc, &argv);
+			}
 			else if (*opt == 'v') {
 				/* empty option */
 				if (*(opt + 1))
@@ -625,15 +647,23 @@ void haproxy_init_args(int argc, char **argv)
 				hld_usage(progname, argc);
 		}
 		else {
+			int is_quic;
 			struct hld_url_cfg *url;
 
-			url = hld_alloc_url(*argv);
+			is_quic = strncmp(*argv, "quic://", 7) == 0;
+			if (is_quic)
+				http_ver = HLD_HTTP_VER_3;
+			hld_ver_flags |= (1 << http_ver);
+			url = hld_alloc_url(*argv, is_quic,
+			                    is_quic ? "h3" : alpn,
+			                    is_quic ? 0 : h2c, http_ver);
 			if (!url) {
 				ha_alert("could not parse a new URL\n");
 				goto leave;
 			}
 
-
+			/* default version flag value */
+			http_ver = HLD_HTTP_VER_3;
 		}
 
 		argv++; argc--;
@@ -652,7 +682,7 @@ void haproxy_init_args(int argc, char **argv)
 
 	/* "global" section */
 	hbuf_appendf(&buf, "%.*s", (int)gbuf.data, gbuf.area);
-	if (arg_thrd != -1)
+	if (arg_thrd != 0)
 		hbuf_appendf(&buf, "\tnbthread %d\n", arg_thrd);
 	if (arg_mreqs)
 		hbuf_appendf(&buf,
@@ -723,8 +753,7 @@ static int hld_pre_check(void)
 	hld_proxy.mode = PR_MODE_HTTP;
 	if (arg_fast)
 		hld_proxy.options2 = PR_O2_SMARTCON;
-	hld_proxy.next = proxies_list;
-    proxies_list = &hld_proxy;
+	main_proxies_register(&hld_proxy);
 
     hld_proxy.timeout.server = 60000;
     hld_proxy.timeout.connect = 60000;

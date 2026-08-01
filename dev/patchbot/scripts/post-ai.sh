@@ -167,8 +167,9 @@ var branch = '$VERSION';
 // server last told us, on top of which the user's edits sit; it starts
 // equal to the original and is only advanced by "Get updates" and by a
 // successful save. The local state is the DOM itself (the checked radios),
-// there is no separate copy. Nothing is fetched automatically: the user
-// explicitly clicks "Get updates" to retrieve the shared state.
+// there is no separate copy. The reference is fetched once at page load and
+// on each "Get updates" click; it is never pushed to nor fetched from the
+// server behind the user's back while reviewing.
 var orig = [];
 var ref_state = [];
 var ref_notes = [];
@@ -183,6 +184,14 @@ var cidmap = {};
 // update proving an exact match, or an explicit cancel.
 var note_mode = [];
 var note_base = [];
+
+// Timeout in milliseconds of the automatic update performed at page load.
+// It exists only so that an unreachable server (the page is also read from
+// places which cannot reach it) delays nothing: the load-time fetch is a
+// convenience, the user did not ask for it, hence it must never make the
+// page look stuck. The manual "Get updates" has no timeout: there the user
+// explicitly asked and is willing to wait.
+var autofetch_ms = 2000;
 
 // SDBM hash (h = c + h * 65599) of a string's UTF-8 bytes, as 8 hex chars;
 // the concurrency token sent with a note replacement. Must match the
@@ -226,6 +235,21 @@ function gen_state(i) {
   if (document.getElementById("bt_" + i + "_w").defaultChecked) return "w";
   if (document.getElementById("bt_" + i + "_y").defaultChecked) return "y";
   return "";
+}
+
+// Tells whether line <i> carries reviewers' notes, be they stored on the
+// server or only typed locally and not saved yet. These are the lines the
+// "O" checkbox keeps when unchecked, the point being to re-read at a glance
+// what was commented so far. The verdicts are deliberately ignored here:
+// they are routinely adjusted on misqualified patches, so taking them into
+// account would leave far too many lines and drown the annotated ones.
+function is_edited(i) {
+  var el;
+
+  if (ref_notes[i])
+    return true;
+  el = document.getElementById("in_" + i);
+  return !!(note_mode[i] && el && el.value.trim());
 }
 
 // captures the bot's verdicts once the table is fully loaded: they preset
@@ -353,8 +377,12 @@ function apply_ref(list) {
   updt_save_btn();
 }
 
-// "Get updates" button: fetches the current shared state from the server
-function fetch_ref() {
+// "Get updates" button: fetches the current shared state from the server.
+// Also called once at page load with <auto> set, in which case the request
+// is aborted after autofetch_ms and its failure is reported as a hint to
+// use the button rather than as an error.
+function fetch_ref(auto) {
+  var ctl = null, tmo = 0;
   var i, el;
 
   if (!branch)
@@ -374,11 +402,26 @@ function fetch_ref() {
       cancel_note(i);
   }
 
-  sync_msg("fetching...");
-  fetch(cgi_url + "?branch=" + branch)
+  if (auto && typeof AbortController != "undefined") {
+    ctl = new AbortController();
+    tmo = setTimeout(function() { ctl.abort(); }, autofetch_ms);
+  }
+
+  sync_msg(auto ? "getting updates..." : "fetching...");
+  fetch(cgi_url + "?branch=" + branch, ctl ? { signal: ctl.signal } : {})
     .then(function(r) { if (!r.ok) throw 0; return r.json(); })
-    .then(function(list) { apply_ref(list); sync_msg("reference updated"); })
-    .catch(function() { sync_msg("fetch failed (server unreachable?)"); });
+    .then(function(list) {
+      if (tmo)
+        clearTimeout(tmo);
+      apply_ref(list);
+      sync_msg("reference updated");
+    })
+    .catch(function() {
+      if (tmo)
+        clearTimeout(tmo);
+      sync_msg(auto ? "no updates retrieved (server unreachable?), use Get updates" :
+                      "fetch failed (server unreachable?)");
+    });
 }
 
 // shows/hides the per-line note links according to the edition mode and to
@@ -619,11 +662,17 @@ function updt_table(line) {
   var u = document.getElementById("sh_u").checked;
   var w = document.getElementById("sh_w").checked;
   var y = document.getElementById("sh_y").checked;
-  var tn = 0, tu = 0, tw = 0, ty = 0;
+  var o = document.getElementById("sh_o").checked;
+  var tn = 0, tu = 0, tw = 0, ty = 0, to = 0, te = 0;
   var bn = 0, bu = 0, bw = 0, by = 0;
-  var i, el;
+  var i, el, ed;
 
   for (i = 1; i < nb_patches; i++) {
+    ed = is_edited(i);
+    if (ed)
+      te++;
+    else
+      to++;
     if (document.getElementById("bt_" + i + "_n").checked) {
       tn++;
       if (bkp[i])
@@ -632,7 +681,7 @@ function updt_table(line) {
         continue;
       el = document.getElementById("tr_" + i);
       el.style.backgroundColor = "$BG_N";
-      el.style.display = n && (b || !bkp[i]) && i >= review ? "" : "none";
+      el.style.display = n && (b || !bkp[i]) && (o || ed) && i >= review ? "" : "none";
     }
     else if (document.getElementById("bt_" + i + "_u").checked) {
       tu++;
@@ -642,7 +691,7 @@ function updt_table(line) {
         continue;
       el = document.getElementById("tr_" + i);
       el.style.backgroundColor = "$BG_U";
-      el.style.display = u && (b || !bkp[i]) && i >= review ? "" : "none";
+      el.style.display = u && (b || !bkp[i]) && (o || ed) && i >= review ? "" : "none";
     }
     else if (document.getElementById("bt_" + i + "_w").checked) {
       tw++;
@@ -652,7 +701,7 @@ function updt_table(line) {
         continue;
       el = document.getElementById("tr_" + i);
       el.style.backgroundColor = "$BG_W";
-      el.style.display = w && (b || !bkp[i]) && i >= review ? "" : "none";
+      el.style.display = w && (b || !bkp[i]) && (o || ed) && i >= review ? "" : "none";
     }
     else if (document.getElementById("bt_" + i + "_y").checked) {
       ty++;
@@ -662,7 +711,7 @@ function updt_table(line) {
         continue;
       el = document.getElementById("tr_" + i);
       el.style.backgroundColor = "$BG_Y";
-      el.style.display = y && (b || !bkp[i]) && i >= review ? "" : "none";
+      el.style.display = y && (b || !bkp[i]) && (o || ed) && i >= review ? "" : "none";
     }
     else {
       // bug
@@ -677,6 +726,8 @@ function updt_table(line) {
   document.getElementById("cnt_u").innerText = tu;
   document.getElementById("cnt_w").innerText = tw;
   document.getElementById("cnt_y").innerText = ty;
+  document.getElementById("cnt_o").innerText = to;
+  document.getElementById("cnt_ed").innerText = te;
 
   document.getElementById("cnt_bn").innerText = bn;
   document.getElementById("cnt_bu").innerText = bu;
@@ -726,14 +777,26 @@ function updt(line,value) {
   updt_table(line);
   updt_output();
   updt_save_btn();
+  if (value == "r")
+    updt_url();
 }
 
-function show_only(b,n,u,w,y) {
+// a "Show" checkbox was clicked: redraw and republish the view in the URL
+function updt_show() {
+  updt_table(0);
+  updt_url();
+}
+
+// selects the categories to show; <o> is optional and defaults to showing
+// the lines without notes, so that the counters' links keep listing
+// everything they count.
+function show_only(b,n,u,w,y,o) {
     document.getElementById("sh_b").checked = !!b;
     document.getElementById("sh_n").checked = !!n;
     document.getElementById("sh_u").checked = !!u;
     document.getElementById("sh_w").checked = !!w;
     document.getElementById("sh_y").checked = !!y;
+    document.getElementById("sh_o").checked = (o === undefined) || !!o;
     document.getElementById("show_all").checked = true;
     updt(0,"r");
 }
@@ -757,6 +820,87 @@ function init_review() {
     }
   }
 }
+
+// the letters of the "Show" checkboxes, in the order they appear in the URL
+// fragment; each one designates the checkbox of id "sh_" plus that letter.
+var show_boxes = "bnuwyo";
+
+// Reflects the current view (the shown categories and the first line to
+// review) into the URL fragment, so that the address bar always holds a link
+// reproducing exactly what is displayed and which can be sent to a coworker
+// as-is. The history entry is replaced and never pushed: nothing is reloaded
+// nor scrolled, the listing does not even blink, and leaving the page still
+// takes a single click on "back".
+function updt_url() {
+  var show = "";
+  var i;
+
+  if (!window.history || !history.replaceState)
+    return;
+
+  for (i = 0; i < show_boxes.length; i++)
+    if (document.getElementById("sh_" + show_boxes.charAt(i)).checked)
+      show += show_boxes.charAt(i);
+
+  // browsers may refuse to touch the history of a page loaded from a local
+  // file (opaque origin). The fragment is then just not maintained, which
+  // affects nothing else, hence the silent catch.
+  try {
+    history.replaceState(null, "", "#show=" + show +
+                         "&start=" + (review ? review : "all"));
+  } catch (e) {
+  }
+}
+
+// Applies the view settings possibly passed in the URL fragment: "show" holds
+// the letters of the categories to display, the missing ones being hidden,
+// and "start" is the first line to review, either "all" or a line number.
+// Both are optional and anything not understood is ignored, so that an old or
+// hand-edited link degrades to the page's defaults instead of breaking. A
+// fragment element without "=" is left alone as well, which preserves the
+// ability to point at a commit id. Only the state is set here, the caller
+// redraws.
+function apply_url() {
+  var args = location.hash.substring(1).split("&");
+  var i, j, eq, key, val, num, el;
+
+  for (i = 0; i < args.length; i++) {
+    eq = args[i].indexOf("=");
+    if (eq < 0)
+      continue;
+    key = args[i].substring(0, eq);
+    val = args[i].substring(eq + 1);
+    if (key == "show") {
+      for (j = 0; j < show_boxes.length; j++)
+        document.getElementById("sh_" + show_boxes.charAt(j)).checked =
+          val.indexOf(show_boxes.charAt(j)) >= 0;
+    }
+    else if (key == "start") {
+      if (val == "all") {
+        document.getElementById("show_all").checked = true;
+        review = 0;
+      }
+      else {
+        num = parseInt(val, 10);
+        el = document.getElementById("rv_" + num);
+        if (el) {
+          el.checked = true;
+          review = num;
+        }
+      }
+    }
+  }
+}
+
+// Pasting a link into a tab which already shows the page only changes the
+// fragment, and the browser reloads nothing: apply it by hand or nothing
+// would happen at all. replaceState() does not trigger this event, so the
+// updates emitted above cannot loop back here.
+window.addEventListener("hashchange", function() {
+  apply_url();
+  updt_table(0);
+  updt_output();
+});
 
 // -->
 </script>
@@ -789,12 +933,14 @@ echo -n "<td style='background-color:$BG_Y'><a href='#' onclick='show_only(0,0,0
 echo -n "<td>total: <span id='cnt_nbt'>0</span></td>"
 echo "</tr></table><P/>"
 echo -n "<big><big>Show:"
-echo -n " <span style='background-color:$BG_B'><input type='checkbox' onclick='updt_table(0);' id='sh_b' checked />B (${#bkp[*]})</span> "
-echo -n " <span style='background-color:$BG_N'><input type='checkbox' onclick='updt_table(0);' id='sh_n' checked />N (<span id='cnt_n'>0</span>)</span> "
-echo -n " <span style='background-color:$BG_U'><input type='checkbox' onclick='updt_table(0);' id='sh_u' checked />U (<span id='cnt_u'>0</span>)</span> "
-echo -n " <span style='background-color:$BG_W'><input type='checkbox' onclick='updt_table(0);' id='sh_w' checked />W (<span id='cnt_w'>0</span>)</span> "
-echo -n " <span style='background-color:$BG_Y'><input type='checkbox' onclick='updt_table(0);' id='sh_y' checked />Y (<span id='cnt_y'>0</span>)</span> "
-echo -n "</big/></big><br/>(B=show backported, N=no/drop, U=uncertain, W=wait/next, Y=yes/pick"
+echo -n " <span style='background-color:$BG_B'><input type='checkbox' onclick='updt_show();' id='sh_b' checked />B (${#bkp[*]})</span> "
+echo -n " <span style='background-color:$BG_N'><input type='checkbox' onclick='updt_show();' id='sh_n' checked />N (<span id='cnt_n'>0</span>)</span> "
+echo -n " <span style='background-color:$BG_U'><input type='checkbox' onclick='updt_show();' id='sh_u' checked />U (<span id='cnt_u'>0</span>)</span> "
+echo -n " <span style='background-color:$BG_W'><input type='checkbox' onclick='updt_show();' id='sh_w' checked />W (<span id='cnt_w'>0</span>)</span> "
+echo -n " <span style='background-color:$BG_Y'><input type='checkbox' onclick='updt_show();' id='sh_y' checked />Y (<span id='cnt_y'>0</span>)</span> "
+echo -n " <span><input type='checkbox' onclick='updt_show();' id='sh_o' checked />O (<span id='cnt_o'>0</span>)</span> "
+echo -n "</big/></big><br/>(B=show backported, N=no/drop, U=uncertain, W=wait/next, Y=yes/pick,"
+echo -n " O=original notes; uncheck to see only the <span id='cnt_ed'>0</span> edited ones"
 echo ")<P/>"
 
 echo "<TABLE COLS=5 BORDER=1 CELLSPACING=0 CELLPADDING=3>"
@@ -899,13 +1045,16 @@ for patch in "${PATCHES[@]}"; do
 
         # the div is the dedicated container for the shared reviewers' notes,
         # filled by full replacement (never appended to) by the JS; the
-        # hidden input receives the user's own note to be pushed on save
+        # hidden input receives the user's own note to be pushed on save.
+        # A note being typed already makes its line count as annotated, so
+        # the table is refreshed on input as well, otherwise the annotated
+        # lines counter would lag behind the keystrokes.
         echo -n "<TD>$resp<div class='notes' id='notes_$seq_num'></div>"
         if [ -n "$VERSION" ]; then
             echo -n "<a href='#' onclick='add_note($seq_num); return false;' id='ln_add_$seq_num' title='Add a shared note to this commit'><small>[add note]</small></a>"
             echo -n " <a href='#' onclick='edit_note($seq_num); return false;' id='ln_edit_$seq_num' style='display:none' title='Edit or delete the whole note'><small>[edit note]</small></a>"
             echo -n " <a href='#' onclick='cancel_note($seq_num); return false;' id='ln_cancel_$seq_num' style='display:none' title='Abort this note edition'><small>[cancel]</small></a>"
-            echo -n " <input type='text' id='in_$seq_num' maxlength='500' size='80' style='display:none' oninput='updt_save_btn();' />"
+            echo -n " <input type='text' id='in_$seq_num' maxlength='500' size='80' style='display:none' oninput='updt_save_btn(); updt_table($seq_num);' />"
         fi
         echo -n "</TD>"
         echo "</TR>"
@@ -939,5 +1088,12 @@ echo "<P/>"
 echo "<H3>Output:</H3>"
 echo "<textarea cols=120 rows=10 id='output'></textarea>"
 echo "<P/>"
-echo "<script type='text/javascript'>nb_patches=$seq_num; review=$review; init_review(); init_ref(); updt_table(0); updt_output();</script>"
+echo "<script type='text/javascript'>nb_patches=$seq_num; review=$review; init_review(); apply_url(); init_ref(); updt_table(0); updt_output();</script>"
+# the shared state is fetched right away so that a page left open or reloaded
+# always shows the current review; forgetting to click "Get updates" is far
+# too easy. It is only a time-boxed attempt (see autofetch_ms), the button
+# remains the way to retry when the server is not reachable.
+if [ -n "$VERSION" ]; then
+	echo "<script type='text/javascript'>fetch_ref(1);</script>"
+fi
 echo "</BODY></HTML>"

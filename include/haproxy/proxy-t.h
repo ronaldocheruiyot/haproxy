@@ -323,7 +323,12 @@ struct proxy {
 	unsigned long last_change;              /* internal use only: last time the proxy state was changed */
 
 	struct list global_list;                /* list member for global proxy list */
-	struct list el;                         /* attach point in various list - currently used only on defaults_list for defaults section */
+	struct list el;                         /* attach point in various list
+	                                         * - <main_proxies> for non internal instance
+	                                         * - <cfg_log_forward> for log forwarder
+	                                         * - <sink_proxies_list> for sink
+	                                         * - <defaults_list> for defaults section
+	                                         */
 
 	unsigned int maxconn;                   /* max # of active streams on the frontend */
 
@@ -362,7 +367,8 @@ struct proxy {
 #ifdef USE_QUIC
 	struct list quic_init_rules;		/* quic-initial rules */
 #endif
-	struct server *srv, *defsrv;		/* known servers; default server configuration */
+	struct list servers;		/* servers present in current backend */
+	struct server *defsrv;			/* default server configuration */
 	struct lbprm lbprm;			/* load-balancing parameters */
 	int srv_act, srv_bck;			/* # of servers eligible for LB (UP|!checked) AND (enabled+weight!=0) */
 	int load_server_state_from_file;	/* location of the file containing server state.
@@ -422,7 +428,6 @@ struct proxy {
 	void *(*stream_new_from_sc)(struct session *sess, struct stconn *sc, struct buffer *in); /* stream instantiation callback for mux stream connector */
 	struct conn_src conn_src;               /* connection source settings */
 	enum obj_type *default_target;		/* default target to use for accepted streams or NULL */
-	struct proxy *next;
 	struct proxy *next_stkt_ref;    /* Link to the list of proxies which refer to the same stick-table. */
 
 	struct list loggers;                    /* one per 'log' directive */

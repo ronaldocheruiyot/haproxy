@@ -38,13 +38,12 @@
 extern struct poller cur_poller; /* the current poller */
 extern int nbpollers;
 extern struct poller pollers[MAX_POLLERS];   /* all registered pollers */
-extern struct fdtab *fdtab;             /* array of all the file descriptors */
-extern struct fdinfo *fdinfo;           /* less-often used infos for file descriptors */
+extern THREAD_LOCAL struct fdtab *fdtab;     /* array of all the file descriptors */
 extern int totalconn;                   /* total # of terminated sessions */
 extern int actconn;                     /* # of active sessions */
 
 extern volatile struct fdlist update_list[MAX_TGROUPS];
-extern struct polled_mask *polled_mask;
+extern THREAD_LOCAL struct polled_mask *polled_mask; /* Array for the polled_mask of each fd */
 
 extern THREAD_LOCAL int *fd_updt;  // FD updates list
 extern THREAD_LOCAL int fd_nbupdt; // number of updates in the list
@@ -96,6 +95,8 @@ void poller_pipe_io_handler(int fd);
  * The pollers register themselves just before main() is called.
  */
 int init_pollers(void);
+
+int fd_precreate_poller_pipes(void);
 
 /*
  * Deinitialize the pollers.
@@ -199,6 +200,7 @@ static inline int fd_active(const int fd)
 /* Disable processing recv events on fd <fd> */
 static inline void fd_stop_recv(int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if (!(fdtab[fd].state & FD_EV_ACTIVE_R) ||
 	    !HA_ATOMIC_BTR(&fdtab[fd].state, FD_EV_ACTIVE_R_BIT))
 		return;
@@ -207,6 +209,7 @@ static inline void fd_stop_recv(int fd)
 /* Disable processing send events on fd <fd> */
 static inline void fd_stop_send(int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if (!(fdtab[fd].state & FD_EV_ACTIVE_W) ||
 	    !HA_ATOMIC_BTR(&fdtab[fd].state, FD_EV_ACTIVE_W_BIT))
 		return;
@@ -217,6 +220,7 @@ static inline void fd_stop_both(int fd)
 {
 	uint old, new;
 
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	old = fdtab[fd].state;
 	do {
 		if (!(old & FD_EV_ACTIVE_RW))
@@ -229,6 +233,7 @@ static inline void fd_stop_both(int fd)
 static inline void fd_cant_recv(const int fd)
 {
 	/* marking ready never changes polled status */
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if (!(fdtab[fd].state & FD_EV_READY_R) ||
 	    !HA_ATOMIC_BTR(&fdtab[fd].state, FD_EV_READY_R_BIT))
 		return;
@@ -238,6 +243,7 @@ static inline void fd_cant_recv(const int fd)
 static inline void fd_may_recv(const int fd)
 {
 	/* marking ready never changes polled status */
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & FD_EV_READY_R) ||
 	    HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_READY_R_BIT))
 		return;
@@ -249,6 +255,7 @@ static inline void fd_may_recv(const int fd)
  */
 static inline void fd_cond_recv(const int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & (FD_EV_ACTIVE_R|FD_EV_READY_R)) == 0)
 		HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_READY_R_BIT);
 }
@@ -259,6 +266,7 @@ static inline void fd_cond_recv(const int fd)
  */
 static inline void fd_cond_send(const int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & (FD_EV_ACTIVE_W|FD_EV_READY_W)) == 0)
 		HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_READY_W_BIT);
 }
@@ -268,6 +276,7 @@ static inline void fd_cond_send(const int fd)
  */
 static inline void fd_may_both(const int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	HA_ATOMIC_OR(&fdtab[fd].state, FD_EV_READY_RW);
 }
 
@@ -284,6 +293,7 @@ static inline void fd_cant_send(const int fd)
 static inline void fd_may_send(const int fd)
 {
 	/* marking ready never changes polled status */
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & FD_EV_READY_W) ||
 	    HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_READY_W_BIT))
 		return;
@@ -292,6 +302,7 @@ static inline void fd_may_send(const int fd)
 /* Prepare FD <fd> to try to receive */
 static inline void fd_want_recv(int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & FD_EV_ACTIVE_R) ||
 	    HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_ACTIVE_R_BIT))
 		return;
@@ -303,6 +314,7 @@ static inline void fd_want_recv(int fd)
  */
 static inline void fd_want_recv_safe(int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & FD_EV_ACTIVE_R) ||
 	    HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_ACTIVE_R_BIT))
 		return;
@@ -313,6 +325,7 @@ static inline void fd_want_recv_safe(int fd)
 /* Prepare FD <fd> to try to send */
 static inline void fd_want_send(int fd)
 {
+	BUG_ON_HOT(fdtab[fd].owner == NULL);
 	if ((fdtab[fd].state & FD_EV_ACTIVE_W) ||
 	    HA_ATOMIC_BTS(&fdtab[fd].state, FD_EV_ACTIVE_W_BIT))
 		return;

@@ -153,7 +153,7 @@ struct post_mortem {
 	struct tgroup_ctx  *tgroup_ctx;  // pointer to ha_tgroup_ctx
 	struct thread_ctx  *thread_ctx;  // pointer to ha_thread_ctx
 	struct list *pools;              // pointer to the head of the pools list
-	struct proxy **proxies;          // pointer to the head of the proxies list
+	struct list *proxies;            // pointer to the head of the proxies list
 	struct global *global;           // pointer to the struct global
 	struct fdtab **fdtab;            // pointer to the fdtab array
 	struct activity *activity;       // pointer to the activity[] per-thread array
@@ -1970,6 +1970,7 @@ static int debug_parse_cli_trace(char **args, char *payload, struct appctx *appc
 /* CLI state for "debug dev fd" */
 struct dev_fd_ctx {
 	int start_fd;
+	int hdr_done;
 };
 
 /* CLI parser for the "debug dev fd" command. The current FD to restart from is
@@ -2005,6 +2006,19 @@ static int debug_iohandler_fd(struct appctx *appctx)
 	chunk_reset(&trash);
 
 	thread_isolate();
+
+	/* thread groups may have their own FD tables, and even their own view
+	 * of the process's FDs, so let's always indicate which group the dump
+	 * is seen from.
+	 */
+	if (!ctx->hdr_done) {
+		chunk_printf(&trash, "# current tgid: %u\n", tgid);
+		if (applet_putchk(appctx, &trash) == -1) {
+			ret = 0;
+			goto leave;
+		}
+		ctx->hdr_done = 1;
+	}
 
 	/* we have two inner loops here, one for the proxy, the other one for
 	 * the buffer.
@@ -2163,6 +2177,7 @@ static int debug_iohandler_fd(struct appctx *appctx)
 		}
 	}
 
+ leave:
 	thread_release();
 	return ret;
 }
@@ -2920,7 +2935,7 @@ process_info:
 	post_mortem.tgroup_ctx  = ha_tgroup_ctx;
 	post_mortem.thread_ctx  = ha_thread_ctx;
 	post_mortem.pools = &pools;
-	post_mortem.proxies = &proxies_list;
+	post_mortem.proxies = &main_proxies;
 	post_mortem.global = &global;
 	post_mortem.fdtab = &fdtab;
 	post_mortem.activity = activity;

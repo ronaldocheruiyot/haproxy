@@ -80,18 +80,6 @@ struct h1s {
 	char ws_key[25];       /* websocket handshake key */
 };
 
-/* Map of headers used to convert outgoing headers */
-struct h1_hdrs_map {
-	char *name;
-	struct eb_root map;
-};
-
-/* An entry in a headers map */
-struct h1_hdr_entry  {
-	struct ist name;
-	struct ebpt_node node;
-};
-
 /* Declare the headers map */
 static struct h1_hdrs_map hdrs_map = { .name = NULL, .map  = EB_ROOT };
 static int accept_payload_with_any_method = 0;
@@ -1742,32 +1730,19 @@ static void h1_process_output_conn_mode(struct h1s *h1s, struct h1m *h1m, struct
 		h1_update_res_conn_value(h1s, h1m, conn_val);
 }
 
-/* Try to adjust the case of the message header name using the global map
- * <hdrs_map>.
+/* Depending on the proxy options, return the global map to use to adjust the
+ * case of the message headers if conversion must be performed, or NULL.
  */
-static void h1_adjust_case_outgoing_hdr(struct h1s *h1s, struct h1m *h1m, struct ist *name)
+static struct h1_hdrs_map *h1_get_hdrs_map(struct h1c *h1c, int isresp)
 {
-	struct ebpt_node *node;
-	struct h1_hdr_entry *entry;
-
-	/* No entry in the map, do nothing */
-	if (eb_is_empty(&hdrs_map.map))
-		return;
-
 	/* No conversion for the request headers */
-	if (!(h1m->flags & H1_MF_RESP) && !(h1s->h1c->px->options2 & PR_O2_H1_ADJ_BUGSRV))
-		return;
-
+	if (!isresp && !(h1c->px->options2 & PR_O2_H1_ADJ_BUGSRV))
+		return NULL;
 	/* No conversion for the response headers */
-	if ((h1m->flags & H1_MF_RESP) && !(h1s->h1c->px->options2 & PR_O2_H1_ADJ_BUGCLI))
-		return;
+	if (isresp && !(h1c->px->options2 & PR_O2_H1_ADJ_BUGCLI))
+		return NULL;
 
-	node = ebis_lookup_len(&hdrs_map.map, name->ptr, name->len);
-	if (!node)
-		return;
-	entry = container_of(node, struct h1_hdr_entry, node);
-	name->ptr = entry->name.ptr;
-	name->len = entry->name.len;
+	return &hdrs_map;
 }
 
 /* Append the description of what is present in error snapshot <es> into <out>.
@@ -2657,6 +2632,7 @@ static size_t h1_make_stline(struct h1s *h1s, struct h1m *h1m, struct htx *htx, 
 static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx, size_t count)
 {
 	struct h1c *h1c = h1s->h1c;
+	struct h1_hdrs_map *hdrs_map = h1_get_hdrs_map(h1c, (h1m->flags & H1_MF_RESP));
 	struct htx_blk *blk;
 	struct buffer outbuf;
 	enum htx_blk_type type;
@@ -2749,10 +2725,7 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 			    isteqi(n, h1c->px->server_id_hdr_name))
 				goto nextblk;
 
-			/* Try to adjust the case of the header name */
-			if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
-				h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
-			if (!h1_format_htx_hdr(n, v, &outbuf))
+			if (!h1_format_htx_hdr(n, v, &outbuf, hdrs_map))
 				goto full;
 		}
 		else if (type == HTX_BLK_EOH) {
@@ -2799,6 +2772,7 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, size_t count)
 {
 	struct h1c *h1c = h1s->h1c;
+	struct h1_hdrs_map *hdrs_map = h1_get_hdrs_map(h1c, (h1m->flags & H1_MF_RESP));
 	struct htx_blk *blk;
 	struct buffer outbuf;
 	enum htx_blk_type type;
@@ -2852,9 +2826,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 			else {
 				/* It is the request: Add "Content-Length: 0" header and skip payload */
 				struct ist n = ist("content-length");
-				if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
-					h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
-				if (!h1_format_htx_hdr(n, ist("0"), &outbuf))
+				if (!h1_format_htx_hdr(n, ist("0"), &outbuf, hdrs_map))
 					goto full;
 
 				h1m->flags = (h1m->flags & ~(H1_MF_XFER_ENC|H1_MF_CHNK)) | H1_MF_CLEN;
@@ -2893,10 +2865,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		v = ist("");
 		h1_process_output_conn_mode(h1s, h1m, &v);
 		if (v.len) {
-			/* Try to adjust the case of the header name */
-			if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
-				h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
-			if (!h1_format_htx_hdr(n, v, &outbuf))
+			if (!h1_format_htx_hdr(n, v, &outbuf, hdrs_map))
 				goto full;
 		}
 		h1s->flags |= H1S_F_HAVE_O_CONN;
@@ -2916,9 +2885,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		/* chunking needed but header not seen */
 		n = ist("transfer-encoding");
 		v = ist("chunked");
-		if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
-			h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
-		if (!h1_format_htx_hdr(n, v, &outbuf))
+		if (!h1_format_htx_hdr(n, v, &outbuf, hdrs_map))
 			goto full;
 		TRACE_STATE("add \"Transfer-Encoding: chunked\"", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
 		h1s->flags |= H1S_F_HAVE_CHNK;
@@ -2932,11 +2899,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		if (srv) {
 			n = h1c->px->server_id_hdr_name;
 			v = ist(srv->id);
-
-			/* Try to adjust the case of the header name */
-			if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
-				h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
-			if (!h1_format_htx_hdr(n, v, &outbuf))
+			if (!h1_format_htx_hdr(n, v, &outbuf, hdrs_map))
 				goto full;
 		}
 		TRACE_STATE("add server name header", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
@@ -2953,9 +2916,9 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
                          */
 			h1_generate_random_ws_input_key(h1s->ws_key);
 
-			if (!h1_format_htx_hdr(ist("Sec-Websocket-Key"),
+			if (!h1_format_htx_hdr(ist("sec-websocket-key"),
 					       ist(h1s->ws_key),
-					       &outbuf)) {
+					       &outbuf, hdrs_map)) {
 				goto full;
 			}
 		}
@@ -2964,9 +2927,9 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 			char key[29];
 
 			h1_calculate_ws_output_key(h1s->ws_key, key);
-			if (!h1_format_htx_hdr(ist("Sec-Websocket-Accept"),
+			if (!h1_format_htx_hdr(ist("sec-websocket-accept"),
 					       ist(key),
-					       &outbuf)) {
+					       &outbuf, hdrs_map)) {
 				goto full;
 			}
 		}
@@ -3465,6 +3428,7 @@ static size_t h1_make_tunnel(struct h1s *h1s, struct h1m *h1m, struct buffer *bu
 static size_t h1_make_trailers(struct h1s *h1s, struct h1m *h1m, struct htx *htx, size_t count)
 {
 	struct h1c *h1c = h1s->h1c;
+	struct h1_hdrs_map *hdrs_map = h1_get_hdrs_map(h1c, (h1m->flags & H1_MF_RESP));
 	struct htx_blk *blk;
 	struct buffer outbuf;
 	enum htx_blk_type type;
@@ -3501,10 +3465,7 @@ static size_t h1_make_trailers(struct h1s *h1s, struct h1m *h1m, struct htx *htx
 			n = htx_get_blk_name(htx, blk);
 			v = htx_get_blk_value(htx, blk);
 
-			/* Try to adjust the case of the header name */
-			if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
-				h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
-			if (!h1_format_htx_hdr(n, v, &outbuf))
+			if (!h1_format_htx_hdr(n, v, &outbuf, hdrs_map))
 				goto full;
 		}
 		else if (type == HTX_BLK_EOT) {
@@ -3783,6 +3744,7 @@ static void h1_alert(struct h1s *h1s)
 static int h1_send_error(struct h1c *h1c)
 {
 	struct buffer *errmsg = NULL;
+	struct h1_hdrs_map *hdrs_map = h1_get_hdrs_map(h1c, 1);
 	int rc = http_get_status_idx(h1c->errcode);
 	int ret = 0;
 
@@ -3801,6 +3763,9 @@ static int h1_send_error(struct h1c *h1c)
 		errmsg = h1c->px->replies[rc]->body.errmsg;
 	}
 
+	if (!errmsg)
+		errmsg = &http_err_chunks[rc];
+
 	if (h1c->flags & (H1C_F_OUT_ALLOC|H1C_F_OUT_FULL)) {
 		h1c->flags |= H1C_F_ABRT_PENDING;
 		goto out;
@@ -3811,10 +3776,8 @@ static int h1_send_error(struct h1c *h1c)
 		TRACE_STATE("waiting for h1c obuf allocation", H1_EV_H1C_ERR|H1_EV_H1C_BLK, h1c->conn);
 		goto out;
 	}
-	if (errmsg)
-		ret = h1_format_htx_msg(htxbuf(errmsg), &h1c->obuf);
-	else
-		ret = b_istput(&h1c->obuf, ist(http_err_msgs[rc]));
+
+	ret = h1_format_htx_msg(htxbuf(errmsg), &h1c->obuf, hdrs_map);
 	if (unlikely(ret <= 0)) {
 		if (!ret) {
 			h1c->flags |= (H1C_F_OUT_FULL|H1C_F_ABRT_PENDING);

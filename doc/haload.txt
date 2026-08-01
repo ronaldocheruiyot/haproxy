@@ -61,23 +61,25 @@ HALoad displays its usage when run without argument or wrong arguments:
             -h(0|1|2|2c|3)   use h0 (hq-interop for QUIC), h1, h2, h2c or h3
                              (QUIC/TCP) protocols (*)
             -(0|1|2|2c|3)    same as above (*)
+            -hs              show HTTP status codes distribution
+            -hsv             show HTTP status codes distribution ((global + per HTTP version)
             -l               enable long output format; double for raw values
             -m <streams>     maximum concurrent streams (1)
             -n <reqs>        maximum total requests (-1)
             -r <reqs>        number of requests per connection (-1)
             -s <time>        soft start: time in sec to reach 100% load
-            -t <threads>     number of threads
+            -t <threads>     number of threads (1)
             -u <users>       number of users (1)
             -w <time>        I/O timeout in milliseconds (10000)
             -C               dump the configuration and exit
             -H "foo:bar"     add this header name and value
             -I               use HEAD instead of GET
+            -R <rate>        limit to this many request attempts per second (0)
             -v               shows version
             --defaults <str> add a string to default section
             --global <str>   add a string to global section
             --server <opts>  set server <opt> options as defined for "server"
                              haproxy keyword
-            --show-status-codes show HTTP status codes distribution
             --traces         enable the traces for all the HTTP protocols
     SSL options:
             --tls-ciphers <ciphers>      for TLS1.2 and below (*)

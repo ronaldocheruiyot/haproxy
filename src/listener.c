@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <import/ist.h>
@@ -56,6 +57,8 @@ static struct task *global_listener_queue_task;
 /* number of times an accepted connection resulted in maxconn being reached */
 ullong maxconn_reached = 0;
 __decl_thread(static HA_RWLOCK_T global_listener_rwlock);
+
+static void rx_agent_schedule_op(struct receiver *rx, uint op);
 
 /* listener status for stats */
 const char* li_status_st[LI_STATE_COUNT] = {
@@ -324,6 +327,11 @@ void listener_set_state(struct listener *l, enum li_state st)
  */
 void enable_listener(struct listener *listener)
 {
+	if (tg_agents_enabled && rx_owner_tgid(&listener->rx) != tgid) {
+		rx_agent_schedule_op(&listener->rx, RX_AGENT_OP_ENABLE);
+		return;
+	}
+
 	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &listener->lock);
 
 	/* If this listener is supposed to be only in the master, close it in
@@ -539,6 +547,11 @@ int suspend_listener(struct listener *l, int lpx, int lli)
 	if (!(l->flags & LI_F_FINALIZED) || l->state <= LI_PAUSED)
 		goto end;
 
+	if (tg_agents_enabled && rx_owner_tgid(&l->rx) != tgid) {
+		rx_agent_schedule_op(&l->rx, RX_AGENT_OP_SUSPEND);
+		goto end;
+	}
+
 	if (l->rx.proto->suspend) {
 		ret = l->rx.proto->suspend(l);
 		/* if the suspend() fails, we don't want to change the
@@ -614,6 +627,22 @@ int resume_listener(struct listener *l, int lpx, int lli)
 
 	if (!(l->flags & LI_F_FINALIZED) || l->state == LI_READY)
 		goto end;
+
+	if (tg_agents_enabled && l->state == LI_ASSIGNED &&
+	    (l->rx.flags & RX_F_MUST_DUP)) {
+		if (l->rx.agent.xfer_fd < 0) {
+			rx_agent_schedule_op(l->rx.shard_info->ref, RX_AGENT_OP_RESUME);
+			goto end;
+		}
+	}
+	else if (tg_agents_enabled && rx_owner_tgid(&l->rx) != tgid) {
+		/* all FD operations, including a possible rebind, must act on
+		 * the owner group's kernel and fdtab tables: delegate to its
+		 * agent and report success, failures will be handled there.
+		 */
+		rx_agent_schedule_op(&l->rx, RX_AGENT_OP_RESUME);
+		goto end;
+	}
 
 	if (l->rx.proto->resume) {
 		ret = l->rx.proto->resume(l);
@@ -746,6 +775,254 @@ void dequeue_proxy_listeners(struct proxy *px, int lpx)
 	}
 }
 
+
+/*
+ * Per-thread-group agents, only set up when FD tables are not shared between
+ * thread groups. Each thread group runs one agent tasklet on its first thread,
+ * to which any thread may post the operations that can only be performed from
+ * inside that group.
+ */
+struct tg_agent {
+	struct tasklet *tl;     /* runs on the group's first thread */
+	struct mt_list ops;     /* receivers with pending operations */
+	int xfer_sock[2];       /* [0]=any sender, [1]=this group's agent */
+};
+
+static struct tg_agent tg_agents[MAX_TGROUPS];
+int tg_agents_enabled = 0;
+
+enum rx_xfer_op {
+	RX_XFER_OP_REBIND = 0,
+	RX_XFER_OP_GETSOCKS,
+};
+
+struct rx_xfer_msg {
+	struct receiver *rx;
+	enum rx_xfer_op op;
+};
+
+static void rx_xfer_send_members(struct receiver *ref);
+static int rx_xfer_send_fd(uint grp, struct receiver *rx, enum rx_xfer_op op, int fd);
+
+/* Queues receiver <rx> to 1-based group <grp>'s agent and wakes it. The
+ * operation fields must be set before calling this, see struct tg_agent.
+ */
+static void rx_agent_post(struct receiver *rx, uint grp)
+{
+	if (MT_LIST_TRY_APPEND(&tg_agents[grp - 1].ops, &rx->agent.link.list))
+		tasklet_wakeup(tg_agents[grp - 1].tl);
+}
+
+static void rx_agent_process_one(struct receiver *rx)
+{
+	int fd = HA_ATOMIC_XCHG(&rx->agent.close_fd, -1);
+	uint dest;
+	uint ops;
+
+	if (fd >= 0)
+		fd_delete(fd);
+
+	ops = HA_ATOMIC_XCHG(&rx->agent.ops, 0);
+	if (ops) {
+		struct listener *l = LIST_ELEM(rx, struct listener *, rx);
+
+		if (ops & RX_AGENT_OP_SUSPEND)
+			suspend_listener(l, 0, 0);
+
+		if (ops & RX_AGENT_OP_RESUME) {
+			resume_listener(l, 0, 0);
+
+			/*
+			 * if this is the reference of a shard spanning several
+			 * groups, pass a copy of the (re)bound FD to the groups
+			 * of the members that still need one, their own group
+			 * will finish their resume with it.
+			 */
+			if ((rx->flags & RX_F_BOUND) && rx->shard_info &&
+			    rx->shard_info->ref == rx)
+				rx_xfer_send_members(rx);
+		}
+
+		if (ops & RX_AGENT_OP_ENABLE)
+			enable_listener(l);
+	}
+
+	dest = HA_ATOMIC_XCHG(&rx->agent.getsocks_grp, 0);
+	if (dest && rx->fd >= 0) {
+		HA_ATOMIC_OR(&fdtab[rx->fd].state, FD_CLONED);
+		rx_xfer_send_fd(dest, rx, RX_XFER_OP_GETSOCKS, rx->fd);
+	}
+}
+
+static struct task *tg_agent_process(struct task *t, void *context, unsigned int state)
+{
+	uint grp = (uint)(ulong)context;
+	struct rx_agent_link *lnk;
+
+	while ((lnk = MT_LIST_POP(&tg_agents[grp].ops, struct rx_agent_link *, list)))
+		rx_agent_process_one(lnk->rx);
+
+	rx_xfer_drain(grp);
+	return t;
+}
+
+void rx_agent_close(struct receiver *rx)
+{
+	HA_ATOMIC_STORE(&rx->agent.close_fd, rx->fd);
+	rx_agent_post(rx, rx_owner_tgid(rx));
+}
+
+static void rx_agent_schedule_op(struct receiver *rx, uint op)
+{
+	HA_ATOMIC_OR(&rx->agent.ops, op);
+	rx_agent_post(rx, rx_owner_tgid(rx));
+}
+
+void rx_agent_getsocks_request(struct receiver *rx, uint dest_grp)
+{
+	HA_ATOMIC_STORE(&rx->agent.getsocks_grp, dest_grp);
+	rx_agent_post(rx, rx_owner_tgid(rx));
+}
+
+static void rx_xfer_send_members(struct receiver *ref)
+{
+	const struct shard_info *si = ref->shard_info;
+	uint i;
+
+	for (i = 0; i < si->nbgroups; i++) {
+		struct receiver *rx = si->members[i];
+		uint grp;
+
+		if (rx == ref || (rx->flags & RX_F_BOUND))
+			continue;
+
+		grp = rx_owner_tgid(rx);
+		rx_xfer_send_fd(grp, rx, RX_XFER_OP_REBIND, ref->fd);
+	}
+}
+
+static int rx_xfer_send_fd(uint grp, struct receiver *rx, enum rx_xfer_op op, int fd)
+{
+	struct rx_xfer_msg xmsg;
+	struct msghdr msg;
+	struct iovec iov;
+	struct cmsghdr *cmsg;
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+
+	xmsg.rx = rx;
+	xmsg.op = op;
+
+	memset(&msg, 0, sizeof(msg));
+	memset(&u, 0, sizeof(u));
+	iov.iov_base = &xmsg;
+	iov.iov_len = sizeof(xmsg);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = u.buf;
+	msg.msg_controllen = sizeof(u.buf);
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+	if (sendmsg(tg_agents[grp - 1].xfer_sock[0], &msg, MSG_DONTWAIT) < 0) {
+		ha_warning("Failed to transfer a listener FD copy to thread group %u (%s).\n",
+		           grp, strerror(errno));
+		return 0;
+	}
+	tasklet_wakeup(tg_agents[grp - 1].tl);
+	return 1;
+}
+
+void rx_xfer_drain(uint grp)
+{
+	while (1) {
+		struct rx_xfer_msg xmsg;
+		struct receiver *rx;
+		struct listener *l;
+		struct msghdr msg;
+		struct iovec iov;
+		struct cmsghdr *cmsg;
+		union {
+			char buf[CMSG_SPACE(sizeof(int))];
+			struct cmsghdr align;
+		} u;
+		ssize_t ret;
+		int fd = -1;
+
+		memset(&msg, 0, sizeof(msg));
+		iov.iov_base = &xmsg;
+		iov.iov_len = sizeof(xmsg);
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = u.buf;
+		msg.msg_controllen = sizeof(u.buf);
+
+		ret = recvmsg(tg_agents[grp].xfer_sock[1], &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+		if (ret <= 0)
+			break;
+
+		cmsg = CMSG_FIRSTHDR(&msg);
+		if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
+			memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+
+		/* platforms with no MSG_CMSG_CLOEXEC get it set by hand */
+		if (!MSG_CMSG_CLOEXEC && fd >= 0)
+			fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+		if (ret != sizeof(xmsg) || fd < 0) {
+			if (fd >= 0)
+				close(fd);
+			continue;
+		}
+		rx = xmsg.rx;
+
+		switch (xmsg.op) {
+		case RX_XFER_OP_REBIND:
+			rx->agent.xfer_fd = fd;
+			l = LIST_ELEM(rx, struct listener *, rx);
+			resume_listener(l, 0, 0);
+			if (rx->agent.xfer_fd >= 0) {
+				close(rx->agent.xfer_fd);
+				rx->agent.xfer_fd = -1;
+			}
+			break;
+
+		case RX_XFER_OP_GETSOCKS:
+			HA_ATOMIC_STORE(&rx->agent.getsocks_fd, fd);
+			break;
+
+		default:
+			close(fd);
+			break;
+		}
+	}
+}
+
+int rx_agent_init(void)
+{
+	uint i;
+
+	for (i = 0; i < global.nbtgroups; i++) {
+		MT_LIST_INIT(&tg_agents[i].ops);
+		if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, tg_agents[i].xfer_sock) < 0)
+			return 0;
+		fd_set_nonblock(tg_agents[i].xfer_sock[1]);
+		tg_agents[i].tl = tasklet_new();
+		if (!tg_agents[i].tl)
+			return 0;
+		tg_agents[i].tl->process = tg_agent_process;
+		tg_agents[i].tl->context = (void *)(ulong)i;
+		tg_agents[i].tl->tid = ha_tgroup_info[i].base;
+	}
+	protocol_init_rx_agents();
+	tg_agents_enabled = 1;
+	return 1;
+}
 
 /* default function used to unbind a listener. This is for use by standard
  * protocols working on top of accepted sockets. The receiver's rx_unbind()
@@ -1270,11 +1547,19 @@ void listener_accept(struct listener *l)
 		if (l->rx.shard_info || atleast2(mask)) {
 			struct accept_queue_ring *ring;
 			struct listener *new_li;
+			struct shard_info *shi;
 			uint r1, r2, t, t1, t2;
 			ulong n0, n1;
 			const struct tgroup_info *g1, *g2;
 			ulong m1, m2;
 			ulong *thr_idx_ptr;
+
+			/*
+			 * Don't attempt to rebalance the connection to
+			 * other thread groups if we do not share the
+			 * file descriptor tables across thread groups.
+			 */
+			shi = (global.tune.options & GTUNE_NO_TG_FD_SHARING) ? NULL : l->rx.shard_info;
 
 			/* The principle is that we have two running indexes,
 			 * each visiting in turn all threads bound to this
@@ -1310,7 +1595,7 @@ void listener_accept(struct listener *l)
 			/* keep a copy for the final update. thr_idx is composite
 			 * and made of (n2<<16) + n1.
 			 */
-			thr_idx_ptr = l->rx.shard_info ? &((struct listener *)(l->rx.shard_info->ref->owner))->thr_idx : &l->thr_idx;
+			thr_idx_ptr = shi ? &((struct listener *)(shi->ref->owner))->thr_idx : &l->thr_idx;
 			while (1) {
 				int q0, q1, q2;
 
@@ -1322,13 +1607,13 @@ void listener_accept(struct listener *l)
 				r1 = ((uint)n0 / LONGBITS) & (LONGBITS - 1);
 
 				while (1) {
-					if (l->rx.shard_info) {
+					if (shi) {
 						/* multiple listeners, take the group into account */
-						if (r1 >= l->rx.shard_info->nbgroups)
+						if (r1 >= shi->nbgroups)
 							r1 = 0;
 
-						g1 = &ha_tgroup_info[l->rx.shard_info->members[r1]->bind_tgroup - 1];
-						m1 = l->rx.shard_info->members[r1]->bind_thread;
+						g1 = &ha_tgroup_info[shi->members[r1]->bind_tgroup - 1];
+						m1 = shi->members[r1]->bind_thread;
 					} else {
 						/* single listener */
 						r1 = 0;
@@ -1346,7 +1631,7 @@ void listener_accept(struct listener *l)
 							 * first thread of next group.
 							 */
 							t1 = 0;
-							if (l->rx.shard_info)
+							if (shi)
 								r1++;
 							/* loop again */
 							continue;
@@ -1366,19 +1651,19 @@ void listener_accept(struct listener *l)
 				 */
 				if ((global.tune.options & GTUNE_LISTENER_MQ_ANY) == GTUNE_LISTENER_MQ_FAIR) {
 					t = g1->base + t1;
-					if (l->rx.shard_info && t != tid)
-						new_li = l->rx.shard_info->members[r1]->owner;
+					if (shi && t != tid)
+						new_li = shi->members[r1]->owner;
 					goto updt_t1;
 				}
 
 				while (1) {
-					if (l->rx.shard_info) {
+					if (shi) {
 						/* multiple listeners, take the group into account */
-						if (r2 >= l->rx.shard_info->nbgroups)
-							r2 = l->rx.shard_info->nbgroups - 1;
+						if (r2 >= shi->nbgroups)
+							r2 = shi->nbgroups - 1;
 
-						g2 = &ha_tgroup_info[l->rx.shard_info->members[r2]->bind_tgroup - 1];
-						m2 = l->rx.shard_info->members[r2]->bind_thread;
+						g2 = &ha_tgroup_info[shi->members[r2]->bind_tgroup - 1];
+						m2 = shi->members[r2]->bind_thread;
 					} else {
 						/* single listener */
 						r2 = 0;
@@ -1400,7 +1685,7 @@ void listener_accept(struct listener *l)
 							 * last thread of previous group.
 							 */
 							t2 = global.maxthrpertgroup - 1;
-							if (l->rx.shard_info)
+							if (shi)
 								r2--;
 							/* loop again */
 							continue;
@@ -1429,9 +1714,9 @@ void listener_accept(struct listener *l)
 
 				/* add to this the currently active connections */
 				q0 += _HA_ATOMIC_LOAD(&l->thr_conn[ti->ltid]);
-				if (l->rx.shard_info) {
-					q1 += _HA_ATOMIC_LOAD(&((struct listener *)l->rx.shard_info->members[r1]->owner)->thr_conn[t1]);
-					q2 += _HA_ATOMIC_LOAD(&((struct listener *)l->rx.shard_info->members[r2]->owner)->thr_conn[t2]);
+				if (shi) {
+					q1 += _HA_ATOMIC_LOAD(&((struct listener *)shi->members[r1]->owner)->thr_conn[t1]);
+					q2 += _HA_ATOMIC_LOAD(&((struct listener *)shi->members[r2]->owner)->thr_conn[t2]);
 				} else {
 					q1 += _HA_ATOMIC_LOAD(&l->thr_conn[t1]);
 					q2 += _HA_ATOMIC_LOAD(&l->thr_conn[t2]);
@@ -1457,12 +1742,12 @@ void listener_accept(struct listener *l)
 					if (q0 <= q1)
 						t = tid;
 
-					if (l->rx.shard_info && t != tid)
-						new_li = l->rx.shard_info->members[r1]->owner;
+					if (shi && t != tid)
+						new_li = shi->members[r1]->owner;
 
 					t2--;
 					if (t2 >= global.maxthrpertgroup) {
-						if (l->rx.shard_info)
+						if (shi)
 							r2--;
 						t2 = global.maxthrpertgroup - 1;
 					}
@@ -1472,8 +1757,8 @@ void listener_accept(struct listener *l)
 					if (q0 <= q2)
 						t = tid;
 
-					if (l->rx.shard_info && t != tid)
-						new_li = l->rx.shard_info->members[r2]->owner;
+					if (shi && t != tid)
+						new_li = shi->members[r2]->owner;
 					goto updt_t1;
 				}
 				else { // q1 == q2
@@ -1481,12 +1766,12 @@ void listener_accept(struct listener *l)
 					if (q0 < q1) // local must be strictly better than both
 						t = tid;
 
-					if (l->rx.shard_info && t != tid)
-						new_li = l->rx.shard_info->members[r1]->owner;
+					if (shi && t != tid)
+						new_li = shi->members[r1]->owner;
 				updt_t1:
 					t1++;
 					if (t1 >= global.maxthrpertgroup) {
-						if (l->rx.shard_info)
+						if (shi)
 							r1++;
 						t1 = 0;
 					}

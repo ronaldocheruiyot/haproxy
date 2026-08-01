@@ -14,6 +14,7 @@
 #include <haproxy/api.h>
 #include <haproxy/backend.h>
 #include <haproxy/lb_map.h>
+#include <haproxy/proxy.h>
 #include <haproxy/queue.h>
 #include <haproxy/server-t.h>
 
@@ -49,13 +50,13 @@ static void recalc_server_map(struct proxy *px)
 	 * the first declared. This is an important assumption for the backup
 	 * case, where we want the first server only.
 	 */
-	for (cur = px->srv; cur; cur = cur->next)
+	list_for_each_entry(cur, &px->servers, el_px)
 		cur->wscore = 0;
 
 	for (o = 0; o < tot; o++) {
 		int max = 0;
 		best = NULL;
-		for (cur = px->srv; cur; cur = cur->next) {
+		list_for_each_entry(cur, &px->servers, el_px) {
 			if ((cur->flags & SRV_F_BACKUP) == flag &&
 			    srv_willbe_usable(cur)) {
 				int v;
@@ -143,7 +144,7 @@ static int init_server_map(struct proxy *p)
 	int pgcd;
 	int act, bck;
 
-	if (!p->srv)
+	if (LIST_ISEMPTY(&p->servers))
 		return 0;
 
 	/* We will factor the weights to reduce the table,
@@ -152,13 +153,13 @@ static int init_server_map(struct proxy *p)
 	 * find a non-zero weight server.
 	 */
 	pgcd = 1;
-	srv = p->srv;
+	srv = proxy_first_server(p);
 	while (srv && !srv->uweight)
-		srv = srv->next;
+		srv = proxy_next_server(srv);
 
 	if (srv) {
 		pgcd = srv->uweight; /* note: cannot be zero */
-		while (pgcd > 1 && (srv = srv->next)) {
+		while (pgcd > 1 && (srv = proxy_next_server(srv))) {
 			int w = srv->uweight;
 			while (w) {
 				int t = pgcd % w;
@@ -175,7 +176,7 @@ static int init_server_map(struct proxy *p)
 	p->lbprm.wmult = pgcd;
 
 	act = bck = 0;
-	for (srv = p->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &p->servers, el_px) {
 		srv->next_eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
 
 		if (srv->flags & SRV_F_BACKUP)

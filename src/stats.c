@@ -596,7 +596,7 @@ int stats_dump_stat_to_buffer(struct stconn *sc, struct buffer *buf, struct htx 
 		ctx->state = STAT_STATE_LIST;
 		/* Update ctx->obj1 via watcher to point on the first proxy. */
 		if (domain == STATS_DOMAIN_PROXY)
-			watcher_attach(&ctx->px_watch, proxies_list);
+			watcher_attach(&ctx->px_watch, main_proxies_first());
 
 		__fallthrough;
 
@@ -890,6 +890,21 @@ static int cli_parse_clear_counters(char **args, char *payload, struct appctx *a
 {
 	int clrall = 0;
 
+	/* "clear counters server <b>/<s> [force]" resets the counters of a
+	 * single server. Handled here rather than via a dedicated three-word
+	 * CLI keyword because "clear counters" is a two-word keyword that would
+	 * shadow any three-word variant during keyword lookup. Requires ADMIN
+	 * level like "clear counters all": it clears cumulative counters, and
+	 * an OPER-only user must not be able to wipe those to hide activity.
+	 */
+	if (strcmp(args[2], "server") == 0) {
+		int force = (strcmp(args[4], "force") == 0);
+
+		if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+			return 1;
+		return cli_clear_counters_server(appctx, args[3], force);
+	}
+
 	if (strcmp(args[2], "all") == 0)
 		clrall = 1;
 
@@ -1167,7 +1182,7 @@ int stats_allocate_proxy_counters(struct proxy *px)
 		}
 	}
 
-	for (sv = px->srv; sv; sv = sv->next) {
+	list_for_each_entry(sv, &px->servers, el_px) {
 		if (!stats_allocate_proxy_counters_internal(&sv->extra_counters,
 		                                            COUNTERS_SV,
 		                                            STATS_PX_CAP_SRV,
@@ -1226,7 +1241,7 @@ static int allocate_stats_px_postcheck(void)
 		i += offset;
 	}
 
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &main_proxies, el) {
 		if (!stats_allocate_proxy_counters(px)) {
 			ha_alert("stats: cannot allocate all counters for proxy statistics\n");
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1355,7 +1370,7 @@ REGISTER_PER_THREAD_FREE(free_trash_counters);
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "clear", "counters",  NULL },      "clear counters [all]                    : clear max statistics counters (or all counters)", cli_parse_clear_counters, NULL, NULL },
+	{ { "clear", "counters",  NULL },      "clear counters [all|server <bk>/<srv> [force]] : clear max statistics counters (or all, or one server's)", cli_parse_clear_counters,   NULL, NULL },
 	{ { "show", "info",  NULL },           "show info [desc|json|typed|float]*      : report information about the running process",    cli_parse_show_info, cli_io_handler_dump_info, NULL },
 	{ { "show", "stat",  NULL },           "show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server",       cli_parse_show_stat, cli_io_handler_dump_stat, cli_io_handler_release_stat },
 	{ { "show", "schema",  "json", NULL }, "show schema json                        : report schema used for stats",                    cli_parse_show_schema_json, cli_io_handler_dump_json_schema, NULL },

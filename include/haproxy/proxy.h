@@ -35,8 +35,8 @@
 #include <haproxy/ticks.h>
 #include <haproxy/thread.h>
 
-extern struct proxy *proxies_list;
-extern struct list proxies;
+extern struct list main_proxies;
+extern struct list all_proxies;
 extern struct ceb_root *used_proxy_id;  /* list of proxy IDs in use */
 extern unsigned int error_snapshot_id;  /* global ID assigned to each error then incremented */
 extern struct ceb_root *proxy_by_name;    /* tree of proxies sorted by name */
@@ -312,6 +312,57 @@ static inline void increment_send_rate(uint64_t bytes, int splice)
 		_HA_ATOMIC_ADD(&th_ctx->spliced_out_bytes, bytes);
 	_HA_ATOMIC_ADD(&th_ctx->out_bytes, bytes);
 	update_freq_ctr(&th_ctx->out_32bps, (bytes + 16) / 32);
+}
+
+/* Append <px> at the end of the global list of visible proxies. */
+static inline void main_proxies_register(struct proxy *px)
+{
+	LIST_APPEND(&main_proxies, &px->el);
+}
+
+/* Returns first entry in main proxies list or NULL if empty. */
+static inline struct proxy *main_proxies_first(void)
+{
+	if (LIST_ISEMPTY(&main_proxies))
+		return NULL;
+	return LIST_ELEM(main_proxies.n, struct proxy *, el);
+}
+
+/* Returns first entry in main proxies list unless <px> is already set. This is
+ * useful when iterating over proxies with possible task yielding interruption.
+ */
+static inline struct proxy *main_proxies_cond_first(struct proxy *px)
+{
+	if (!px && !LIST_ISEMPTY(&main_proxies))
+		px = LIST_ELEM(main_proxies.n, struct proxy *, el);
+	return px;
+}
+
+/* Return next entry after <px> in main proxies list or NULL if reaching end of list. */
+static inline struct proxy *main_proxies_next(const struct proxy *px)
+{
+	if (px->el.n == &main_proxies)
+		return NULL;
+	return LIST_ELEM(px->el.n, struct proxy *, el);
+}
+
+static inline struct server *proxy_first_server(const struct proxy *px)
+{
+	return !LIST_ISEMPTY(&px->servers) ?
+	  LIST_NEXT(&px->servers, struct server *, el_px) : NULL;
+}
+
+static inline struct server *proxy_last_server(const struct proxy *px)
+{
+	return !LIST_ISEMPTY(&px->servers) ?
+	  LIST_PREV(&px->servers, struct server *, el_px) : NULL;
+}
+
+static inline struct server *proxy_next_server(const struct server *srv)
+{
+	if (srv->el_px.n == &srv->proxy->servers)
+		return NULL;
+	return LIST_ELEM(srv->el_px.n, struct server *, el_px);
 }
 
 #endif /* _HAPROXY_PROXY_H */

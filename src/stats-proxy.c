@@ -1160,7 +1160,7 @@ static void stats_fill_be_computesrv(struct proxy *px, int *nbup, int *nbsrv, in
 	const struct server *srv;
 
 	nbup_tmp = nbsrv_tmp = totuw_tmp = 0;
-	for (srv = px->srv; srv; srv = srv->next) {
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->cur_state != SRV_ST_STOPPED) {
 			nbup_tmp++;
 			if (srv_currently_usable(srv) &&
@@ -1254,7 +1254,7 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 				break;
 			case ST_I_PX_STATUS:
 				fld = chunk_newstr(out);
-				chunk_appendf(out, "%s", (px->lbprm.tot_weight > 0 || !px->srv) ? "UP" : "DOWN");
+				chunk_appendf(out, "%s", (px->lbprm.tot_weight > 0 || LIST_ISEMPTY(&px->servers)) ? "UP" : "DOWN");
 				if (px->flags & PR_FL_BE_UNPUBLISHED)
 					chunk_appendf(out, " (UNPUB)");
 				if (flags & (STAT_F_HIDE_MAINT|STAT_F_HIDE_DOWN))
@@ -1281,7 +1281,7 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 				field = mkf_u32(0, px->srv_bck);
 				break;
 			case ST_I_PX_DOWNTIME:
-				if (px->srv)
+				if (!LIST_ISEMPTY(&px->servers))
 					field = mkf_u32(FN_COUNTER, be_downtime(px));
 				break;
 			case ST_I_PX_PID:
@@ -1529,7 +1529,7 @@ more:
 		}
 
 		/* for servers ctx.obj2 is set via watcher_attach() */
-		watcher_attach(&ctx->srv_watch, px->srv);
+		watcher_attach(&ctx->srv_watch, proxy_first_server(px));
 		ctx->px_st = STAT_PX_ST_SV;
 
 		__fallthrough;
@@ -1537,7 +1537,7 @@ more:
 	case STAT_PX_ST_SV:
 		/* obj2 is updated and returned through watcher_next() */
 		for (sv = ctx->obj2; sv;
-		     sv = watcher_next(&ctx->srv_watch, sv->next)) {
+		     sv = watcher_next(&ctx->srv_watch, proxy_next_server(sv))) {
 
 			if (stats_is_full(appctx, buf, htx))
 				goto full;
@@ -1635,7 +1635,7 @@ int stats_dump_proxies(struct stconn *sc, struct buffer *buf, struct htx *htx)
 	/* dump proxies */
 	/* obj1 is updated and returned through watcher_next() */
 	for (px = ctx->obj1; px;
-	     px = watcher_next(&ctx->px_watch, px->next)) {
+	     px = watcher_next(&ctx->px_watch, main_proxies_next(px))) {
 
 		if (stats_is_full(appctx, buf, htx))
 			goto full;
@@ -1667,47 +1667,29 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 	struct listener *li;
 	struct stats_module *mod;
 
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &main_proxies, el) {
 		if (clrall) {
-			memset(&px->be_counters, 0, sizeof(px->be_counters));
-			memset(&px->fe_counters, 0, sizeof(px->fe_counters));
+			counters_be_reset(&px->be_counters);
+			counters_fe_reset(&px->fe_counters);
 		}
 		else {
-			px->be_counters.conn_max = 0;
-			px->be_counters.p.http.rps_max = 0;
-			px->be_counters.sps_max = 0;
-			px->be_counters.cps_max = 0;
-			px->be_counters.nbpend_max = 0;
-			px->be_counters.qtime_max = 0;
-			px->be_counters.ctime_max = 0;
-			px->be_counters.dtime_max = 0;
-			px->be_counters.ttime_max = 0;
-
-			px->fe_counters.conn_max = 0;
-			px->fe_counters.p.http.rps_max = 0;
-			px->fe_counters.sps_max = 0;
-			px->fe_counters.cps_max = 0;
+			counters_be_reset_max(&px->be_counters);
+			counters_fe_reset_max(&px->fe_counters);
 		}
 
-		for (sv = px->srv; sv; sv = sv->next)
+		list_for_each_entry(sv, &px->servers, el_px) {
 			if (clrall)
-				memset(&sv->counters, 0, sizeof(sv->counters));
-			else {
-				sv->counters.cur_sess_max = 0;
-				sv->counters.nbpend_max = 0;
-				sv->counters.sps_max = 0;
-				sv->counters.qtime_max = 0;
-				sv->counters.ctime_max = 0;
-				sv->counters.dtime_max = 0;
-				sv->counters.ttime_max = 0;
-			}
+				counters_be_reset(&sv->counters);
+			else
+				counters_be_reset_max(&sv->counters);
+		}
 
 		list_for_each_entry(li, &px->conf.listeners, by_fe)
 			if (li->counters) {
 				if (clrall)
-					memset(li->counters, 0, sizeof(*li->counters));
+					counters_fe_reset(li->counters);
 				else
-					li->counters->conn_max = 0;
+					counters_fe_reset_max(li->counters);
 			}
 	}
 
@@ -1715,7 +1697,7 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 		if (!mod->clearable && !clrall)
 			continue;
 
-		for (px = proxies_list; px; px = px->next) {
+		list_for_each_entry(px, &main_proxies, el) {
 			enum stats_domain_px_cap mod_cap = stats_px_get_cap(mod->domain_flags);
 
 			if (px->cap & PR_CAP_FE && mod_cap & STATS_PX_CAP_FE) {
@@ -1733,7 +1715,7 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 			}
 
 			if (mod_cap & STATS_PX_CAP_SRV) {
-				for (sv = px->srv; sv; sv = sv->next) {
+				list_for_each_entry(sv, &px->servers, el_px) {
 					EXTRA_COUNTERS_INIT(sv->extra_counters,
 				                            mod,
 					                    mod->counters,
@@ -1750,5 +1732,34 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 				}
 			}
 		}
+	}
+}
+
+/* Reset the module-registered extra counters of a single server <sv>, as done
+ * by "clear counters" for every server. Only modules flagged clearable are
+ * reset, matching the OPER-level "clear counters" semantics (the ADMIN-only
+ * "clear counters all" resets non-clearable modules too, but there is no
+ * per-server equivalent of "all"). The native counters are handled separately
+ * by the caller via counters_be_reset().
+ */
+void srv_stats_clear_extra_counters(struct server *sv)
+{
+	struct list *stat_modules = &stats_module_list[STATS_DOMAIN_PROXY];
+	struct stats_module *mod;
+
+	list_for_each_entry(mod, stat_modules, list) {
+		enum stats_domain_px_cap mod_cap = stats_px_get_cap(mod->domain_flags);
+
+		if (!mod->clearable)
+			continue;
+		if (!(mod_cap & STATS_PX_CAP_SRV))
+			continue;
+		if (!sv->extra_counters)
+			continue;
+
+		EXTRA_COUNTERS_INIT(sv->extra_counters,
+		                    mod,
+		                    mod->counters,
+		                    mod->counters_size);
 	}
 }

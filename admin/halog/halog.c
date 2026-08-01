@@ -27,6 +27,8 @@
 #include <import/ebistree.h>
 #include <import/ebsttree.h>
 
+#include <import/ist.h>
+
 #define SOURCE_FIELD 5
 #define ACCEPT_FIELD 6
 #define SERVER_FIELD 8
@@ -121,7 +123,8 @@ struct url_stat {
 
 #define FILT2_TIMESTAMP         0x01
 #define FILT2_PRESERVE_QUERY    0x02
-#define FILT2_EXTRACT_CAPTURE   0x04
+#define FILT2_CAPTURE_PRINT     0x04
+#define FILT2_CAPTURE_MATCH     0x08
 
 #define FILT_OUTPUT_FMT   (FILT_COUNT_ONLY| \
 			   FILT_COUNT_STATUS| \
@@ -158,7 +161,8 @@ void filter_count_term_codes(const char *accept_field, const char *time_field, s
 void filter_count_status(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_graphs(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_output_line(const char *accept_field, const char *time_field, struct timer **tptr);
-void filter_extract_capture(const char *accept_field, const char *time_field, unsigned int, unsigned int);
+struct ist filter_extract_capture(const char *accept_field, const char *time_field, unsigned int, unsigned int);
+void filter_print_capture(const char *accept_field, const char *time_field, unsigned int, unsigned int);
 void filter_accept_holes(const char *accept_field, const char *time_field, struct timer **tptr);
 
 void usage(FILE *output, const char *msg)
@@ -170,6 +174,7 @@ void usage(FILE *output, const char *msg)
 		"  halog [input_filters]* [modifiers]* [output_format] < log\n"
 		"    inp = [-e|-E] [-H] [-Q|-QS] [-rt|-RT <time>] [-ad <delay>] [-ac <count>]\n"
 		"          [-hs|-HS [min][:[max]]] [-tcn|-TCN <termcode>] [-time [min][:[max]]]\n"
+		"          [-hdr-match <block>:<field>=<value>]\n"
 		"    mod = [-q] [-v] [-m <lines>] [-s <skipflds>] [-query]\n"
 		"    out = {-c|-u|-uc|-ue|-ua|-ut|-uao|-uto|-uba|-ubt|-hdr <block>:<field>|\n"
 		"           -cc|-gt|-pct|-st|-tc|-srv|-ic}\n"
@@ -188,7 +193,7 @@ void help()
 {
 	usage(stdout, NULL);
 	printf(
-	       "Input filters - several filters may be combined\n"
+	       "Input filters - several filters may be combined, any of them may be omitted\n"
 	       " -H                      only match lines containing HTTP logs (ignore TCP)\n"
 	       " -E                      only match lines without any error (no 5xx status)\n"
 	       " -e                      only match lines with errors (status 5xx or negative)\n"
@@ -199,7 +204,10 @@ void help()
 	       "                         within min..max. Any of them may be omitted. Exact\n"
 	       "                         code is checked for if no ':' is specified.\n"
 	       " -time <[min][:max]>     only match requests recorded between timestamps.\n"
-	       "                         Any of them may be omitted.\n"
+	       " -hdr-match <block>:<field>=<value>\n"
+	       "                         only match requests where the captured header at the\n"
+	       "                         given <block>:<field> is equal to <value>.\n"
+	       "\n"
 	       "Modifiers\n"
 	       " -v                      invert the input filtering condition\n"
 	       " -q                      don't report errors/warnings\n"
@@ -739,7 +747,9 @@ int main(int argc, char **argv)
 	int filter_time_resp = 0;
 	int filt_http_status_low = 0, filt_http_status_high = 0;
 	unsigned int filt2_timestamp_low = 0, filt2_timestamp_high = 0;
-	unsigned int filt2_capture_block = 0, filt2_capture_field = 0;
+	unsigned int filt2_capture_print_block = 0, filt2_capture_print_field = 0;
+	unsigned int filt2_capture_match_block = 0, filt2_capture_match_field = 0;
+	struct ist filt2_capture_match_value = IST_NULL;
 	int skip_fields = 1;
 
 	void (*line_filter)(const char *accept_field, const char *time_field, struct timer **tptr) = NULL;
@@ -882,7 +892,7 @@ int main(int argc, char **argv)
 			char *sep, *str;
 
 			if (argc < 2) die("missing option for -hdr (<block>:<field>)\n");
-			filter2 |= FILT2_EXTRACT_CAPTURE;
+			filter2 |= FILT2_CAPTURE_PRINT;
 
 			argc--; argv++;
 			str = *argv;
@@ -892,11 +902,38 @@ int main(int argc, char **argv)
 			else
 				*sep++ = 0;
 
-			filt2_capture_block = *str ? atol(str) : 1;
-			filt2_capture_field = *sep ? atol(sep) : 1;
+			filt2_capture_print_block = *str ? atol(str) : 1;
+			filt2_capture_print_field = *sep ? atol(sep) : 1;
 
-			if (filt2_capture_block < 1 || filt2_capture_field < 1)
+			if (filt2_capture_print_block < 1 || filt2_capture_print_field < 1)
 				die("block and field must be at least 1 for -hdr (<block>:<field>)\n");
+		}
+		else if (strcmp(argv[0], "-hdr-match") == 0) {
+			char *colon, *equals, *str;
+
+			if (argc < 2) die("missing option for -hdr-match (<block>:<field>=<value>)\n");
+			filter2 |= FILT2_CAPTURE_MATCH;
+
+			argc--; argv++;
+			str = *argv;
+			colon = strchr(str, ':');
+			if (!colon)
+				die("missing colon in -hdr-match (<block>:<field>=<value>)\n");
+			else
+				*colon++ = 0;
+
+			equals = strchr(colon, '=');
+			if (!equals)
+				die("missing equals in -hdr-match (<block>:<field>=<value>)\n");
+			else
+				*equals++ = 0;
+
+			filt2_capture_match_block = *str ? atol(str) : 1;
+			filt2_capture_match_field = *colon ? atol(colon) : 1;
+			filt2_capture_match_value = ist(equals);
+
+			if (filt2_capture_match_block < 1 || filt2_capture_match_field < 1)
+				die("block and field must be at least 1 for -hdr-match (<block>:<field>=<value>)\n");
 		}
 		else if (strcmp(argv[0], "-o") == 0) {
 			if (output_file)
@@ -990,6 +1027,17 @@ int main(int argc, char **argv)
 		if (accept_field[1] < '0' || accept_field[1] > '3') {
 			parse_err++;
 			continue;
+		}
+
+		if (filter2 & FILT2_CAPTURE_MATCH) {
+			struct ist capture = filter_extract_capture(accept_field, time_field, filt2_capture_match_block, filt2_capture_match_field);
+
+			if (unlikely(!isttest(capture))) {
+				truncated_line(linenum, line);
+				continue;
+			}
+
+			test &= isteq(capture, filt2_capture_match_value);
 		}
 
 		if (filter2 & FILT2_TIMESTAMP) {
@@ -1128,8 +1176,8 @@ int main(int argc, char **argv)
 		if (line_filter) {
 			if (filter & FILT_COUNT_IP_COUNT)
 				filter_count_ip(source_field, accept_field, time_field, &t);
-			else if (filter2 & FILT2_EXTRACT_CAPTURE)
-				filter_extract_capture(accept_field, time_field, filt2_capture_block, filt2_capture_field);
+			else if (filter2 & FILT2_CAPTURE_PRINT)
+				filter_print_capture(accept_field, time_field, filt2_capture_print_block, filt2_capture_print_field);
 			else
 				line_filter(accept_field, time_field, &t);
 		}
@@ -1388,7 +1436,7 @@ void filter_output_line(const char *accept_field, const char *time_field, struct
 	lines_out++;
 }
 
-void filter_extract_capture(const char *accept_field, const char *time_field, unsigned int block, unsigned int field)
+struct ist filter_extract_capture(const char *accept_field, const char *time_field, unsigned int block, unsigned int field)
 {
 	const char *e, *f;
 
@@ -1408,15 +1456,12 @@ void filter_extract_capture(const char *accept_field, const char *time_field, un
 		}
 
 		if (unlikely(!*e)) {
-			truncated_line(linenum, line);
-			return;
+			return IST_NULL;
 		}
 
 		/* We reached the URL, no more captures will follow. */
 		if (*e != '{') {
-			puts("");
-			lines_out++;
-			return;
+			return ist("");
 		}
 
 		/* e points the the opening brace of the capture block. */
@@ -1431,14 +1476,11 @@ void filter_extract_capture(const char *accept_field, const char *time_field, un
 			e++;
 
 		if (unlikely(!*e)) {
-			truncated_line(linenum, line);
-			return;
+			return IST_NULL;
 		}
 
 		if (*e != '|') {
-			puts("");
-			lines_out++;
-			return;
+			return ist("");
 		}
 
 		/* e points to the pipe. */
@@ -1452,11 +1494,22 @@ void filter_extract_capture(const char *accept_field, const char *time_field, un
 		f++;
 
 	if (unlikely(!*f)) {
+		return IST_NULL;
+	}
+
+	return ist2(e, f - e);
+}
+
+void filter_print_capture(const char *accept_field, const char *time_field, unsigned int block, unsigned int field)
+{
+	struct ist capture = filter_extract_capture(accept_field, time_field, block, field);
+
+	if (unlikely(!isttest(capture))) {
 		truncated_line(linenum, line);
 		return;
 	}
 
-	fwrite(e, f - e, 1, stdout);
+	fwrite(istptr(capture), istlen(capture), 1, stdout);
 	putchar('\n');
 	lines_out++;
 }

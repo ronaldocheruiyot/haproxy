@@ -106,6 +106,7 @@ struct show_env_ctx {
 struct show_fd_ctx {
 	int fd;          /* first FD to show, -1=wildcard */
 	int tgid;        /* 0=unspecified, -1=wildcard, >0=specific tgid */
+	int cur_tgid;    /* thread group being dumped (1-based), 0=not started */
 	int show_one;    /* stop after showing one FD */
 	uint show_mask;  /* CLI_SHOWFD_F_xxx */
 };
@@ -470,8 +471,7 @@ static struct proxy *cli_alloc_fe(const char *name, const char *file, int line)
 		return NULL;
 	}
 
-	fe->next = proxies_list;
-	proxies_list = fe;
+	main_proxies_register(fe);
 	fe->maxconn = 10;                 /* default to 10 concurrent connections */
 	fe->timeout.client = MS_TO_TICKS(10000); /* default timeout of 10 seconds */
 	fe->conf.file = copy_file_name(file);
@@ -1486,9 +1486,34 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 	struct show_fd_ctx *fdctx = appctx->svcctx;
 	uint match = fdctx->show_mask;
 	int fd = fdctx->fd;
+	const struct fdtab *tab;
+	const struct polled_mask *pmsk;
+	int grp, last_grp;
 	int ret = 1;
 
 	chunk_reset(&trash);
+
+	/* With per-thread-group FD tables, each thread group has its own
+	 * table: a specific tgid only dumps that group's table, while both
+	 * the wildcard and the unspecified forms visit all the groups in
+	 * turn. With a shared table, all the groups' tables alias the same
+	 * one, so a single pass is always enough and the requested tgid
+	 * makes no difference.
+	 */
+	if (fdctx->tgid > 0)
+		grp = last_grp = fdctx->tgid;
+	else if (global.tune.options & GTUNE_NO_TG_FD_SHARING) {
+		grp = 1;
+		last_grp = global.nbtgroups;
+	}
+	else
+		grp = last_grp = 1;
+
+	if (fdctx->cur_tgid)
+		grp = fdctx->cur_tgid;
+
+	tab = ha_tgroup_ctx[grp - 1].fdtab;
+	pmsk = ha_tgroup_ctx[grp - 1].polled_mask;
 
 	/* isolate the threads once per round. We're limited to a buffer worth
 	 * of output anyway, it cannot last very long.
@@ -1513,7 +1538,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		int is_back = 0;
 		int suspicious = 0;
 
-		fdt = fdtab[fd];
+		fdt = tab[fd];
 
 		/* When DEBUG_FD is set, we also report closed FDs that have a
 		 * non-null event count to detect stuck ones.
@@ -1542,7 +1567,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		}
 #if defined(USE_QUIC)
 		else if (fdt.iocb == quic_conn_sock_fd_iocb) {
-			qc = fdtab[fd].owner;
+			qc = fdt.owner;
 			li = qc ? qc->li : NULL;
 			sv = qc ? (qc->conn ? objt_server(qc->conn->target) : NULL) : NULL;
 			xprt_ctx   = qc ? qc->xprt_ctx : NULL;
@@ -1554,7 +1579,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			 */
 		}
 		else if (fdt.iocb == quic_lstnr_sock_fd_iocb) {
-			li = objt_listener(fdtab[fd].owner);
+			li = objt_listener(fdt.owner);
 		}
 #endif
 		else if (fdt.iocb == sock_accept_iocb)
@@ -1593,8 +1618,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.refc_tgid >> 4) & 0xffff,
 			     (fdt.refc_tgid) & 0xffff,
 			     fdt.thread_mask, fdt.update_mask,
-			     polled_mask[fd].poll_recv,
-			     polled_mask[fd].poll_send,
+			     pmsk[fd].poll_recv,
+			     pmsk[fd].poll_send,
 			     fdt.owner,
 			     fdt.generation,
 			     fdt.nb_takeover,
@@ -1683,22 +1708,39 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			chunk_appendf(&trash, ")");
 
 #ifdef DEBUG_FD
-		chunk_appendf(&trash, " evcnt=%u", fdtab[fd].event_count);
-		if (fdtab[fd].event_count >= 1000000)
+		chunk_appendf(&trash, " evcnt=%u", fdt.event_count);
+		if (fdt.event_count >= 1000000)
 			suspicious = 1;
 #endif
 		chunk_appendf(&trash, "%s\n", suspicious ? " !" : "");
 
 		if (applet_putchk(appctx, &trash) == -1) {
 			fdctx->fd = fd;
+			fdctx->cur_tgid = grp;
 			ret = 0;
-			break;
+			goto end;
 		}
 	skip:
-		if (fdctx->show_one)
-			break;
+		if (fdctx->show_one) {
+			/* for the "/<fd>" wildcard form, show the same FD in
+			 * the next group's table.
+			 */
+			if (grp >= last_grp)
+				break;
+			grp++;
+			tab = ha_tgroup_ctx[grp - 1].fdtab;
+			pmsk = ha_tgroup_ctx[grp - 1].polled_mask;
+			continue;
+		}
 
 		fd++;
+		if (fd >= global.maxsock && grp < last_grp) {
+			/* this group's table is done, proceed with the next one */
+			grp++;
+			tab = ha_tgroup_ctx[grp - 1].fdtab;
+			pmsk = ha_tgroup_ctx[grp - 1].polled_mask;
+			fd = 0;
+		}
 	}
 
  end:
@@ -1842,7 +1884,7 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 	if (*args[arg] == '!' || *args[arg] == '-')
 		ctx->show_mask = CLI_SHOWFD_F_ANY;
 
-	while (*args[arg] && !isdigit((uchar)*args[arg])) {
+	while (*args[arg] && !isdigit((uchar)*args[arg]) && *args[arg] != '/') {
 		uint flag = 0, inv = 0;
 		c = args[arg];
 		while (*c) {
@@ -1871,20 +1913,18 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 		ctx->show_mask = CLI_SHOWFD_F_ANY;
 
 	if (*args[arg]) {
-		c = strchr(args[2], '/');
+		c = strchr(args[arg], '/');
 		if (c) {
 			/* We allow the forms "<tgid>/" and "/<fd>" where the missing
 			 * value is considered a wildcard. So the first form means
 			 * "show me all the fds belonging to <tgid>", while the second
-			 * one means "show the fd <fd> for each thread group". Note
-			 * that the tgid is parsed but ignored for now - this code
-			 * will require changes once we split fd tables.
+			 * one means "show the fd <fd> for each thread group".
 			 */
-			if (c == args[2]) {
+			if (c == args[arg]) {
 				ctx->tgid = -1;
 			} else {
-				ctx->tgid = atoi(args[2]);
-				if (ctx->tgid <= 0 || ctx->tgid > MAX_TGROUPS)
+				ctx->tgid = atoi(args[arg]);
+				if (ctx->tgid <= 0 || ctx->tgid > global.nbtgroups)
 					return cli_err(appctx, "Invalid TGID.\n");
 			}
 			c++;
@@ -1893,7 +1933,7 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 				ctx->show_one = 1;
 			}
 		} else {
-			ctx->fd = atoi(args[2]);
+			ctx->fd = atoi(args[arg]);
 			ctx->show_one = 1;
 		}
 	}
@@ -2445,6 +2485,80 @@ static int bind_parse_severity_output(char **args, int cur_arg, struct proxy *px
 	}
 }
 
+/*
+ * Send one FD, with its relevant informations.
+ */
+static int _getsocks_send_one(int sock, int send_fd, const struct receiver *rx,
+                              struct msghdr *msghdr, unsigned char *tmpbuf,
+                              int *tmpfd, int *nb_queued, int *curoff)
+{
+	const char *ns_name, *if_name;
+	unsigned char ns_nlen, if_nlen;
+
+	ns_name = if_name = "";
+	ns_nlen = if_nlen = 0;
+
+	/* for now we can only retrieve namespaces and interfaces from
+	 * pure listeners.
+	 */
+	if (rx && rx->iocb == sock_accept_iocb) {
+		if (rx->settings->interface) {
+			if_name = rx->settings->interface;
+			if_nlen = strlen(if_name);
+		}
+
+#ifdef USE_NS
+		if (rx->settings->netns) {
+			ns_name = rx->settings->netns->node.key;
+			ns_nlen = rx->settings->netns->name_len;
+		}
+#endif
+	}
+
+	/* put the FD into the CMSG_DATA */
+	tmpfd[(*nb_queued)++] = send_fd;
+
+	/* first block is <ns_name_len> <ns_name> */
+	tmpbuf[(*curoff)++] = ns_nlen;
+	if (ns_nlen)
+		memcpy(tmpbuf + *curoff, ns_name, ns_nlen);
+	*curoff += ns_nlen;
+
+	/* second block is <if_name_len> <if_name> */
+	tmpbuf[(*curoff)++] = if_nlen;
+	if (if_nlen)
+		memcpy(tmpbuf + *curoff, if_name, if_nlen);
+	*curoff += if_nlen;
+
+	/* we used to send the listener options here before 2.3 */
+	memset(tmpbuf + *curoff, 0, sizeof(int));
+	*curoff += sizeof(int);
+
+	/* there's a limit to how many FDs may be sent at once */
+	if (*nb_queued == MAX_SEND_FD) {
+		int ack, ret;
+
+		msghdr->msg_iov->iov_len = *curoff;
+		if (sendmsg(sock, msghdr, 0) != *curoff) {
+			ha_warning("Failed to transfer sockets\n");
+			return 0;
+		}
+
+		/* Wait for an ack */
+		do {
+			ret = recv(sock, &ack, sizeof(ack), 0);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret <= 0) {
+			ha_warning("Unexpected error while transferring sockets\n");
+			return 0;
+		}
+		*curoff = 0;
+		*nb_queued = 0;
+	}
+	return 1;
+}
+
 /* Send all the bound sockets, always returns 1 */
 static int _getsocks(char **args, char *payload, struct appctx *appctx, void *private)
 {
@@ -2458,8 +2572,10 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	struct msghdr msghdr;
 	struct iovec iov;
 	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-	const char *ns_name, *if_name;
-	unsigned char ns_nlen, if_nlen;
+	struct receiver **foreign_rxs = NULL;
+	int *foreign_fds = NULL;
+	int nb_foreign = 0;
+	int foreign_idx;
 	int nb_queued;
 	int cur_fd = 0;
 	int *tmpfd;
@@ -2497,12 +2613,25 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	if (!(strm_li(s)->bind_conf->level & ACCESS_FD_LISTENERS))
 		goto out;
 	memset(&msghdr, 0, sizeof(msghdr));
+
+	/*
+	 * Collect file descriptors from other thread groups, if they have
+	 * a separate file descriptor table.
+	 */
+	nb_foreign = protocol_getsocks_foreign_fds(&foreign_rxs, &foreign_fds);
+	if (nb_foreign < 0) {
+		ha_warning("Failed to allocate memory to transfer other groups' sockets\n");
+		goto out;
+	}
+
 	/*
 	 * First, calculates the total number of FD, so that we can let
 	 * the caller know how much it should expect.
 	 */
 	for (cur_fd = 0;cur_fd < global.maxsock; cur_fd++)
 		tot_fd_nb += !!(fdtab[cur_fd].state & FD_EXPORTED);
+
+	tot_fd_nb += nb_foreign;
 
 	if (tot_fd_nb == 0) {
 		if (already_sent)
@@ -2549,73 +2678,27 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	nb_queued = 0;
 	iov.iov_base = tmpbuf;
 	for (cur_fd = 0; cur_fd < global.maxsock; cur_fd++) {
+		const struct receiver *rx = NULL;
+
 		if (!(fdtab[cur_fd].state & FD_EXPORTED))
 			continue;
 
 		/* this FD is now shared between processes */
 		HA_ATOMIC_OR(&fdtab[cur_fd].state, FD_CLONED);
 
-		ns_name = if_name = "";
-		ns_nlen = if_nlen = 0;
+		if (fdtab[cur_fd].iocb == sock_accept_iocb)
+			rx = &((const struct listener *)fdtab[cur_fd].owner)->rx;
 
-		/* for now we can only retrieve namespaces and interfaces from
-		 * pure listeners.
-		 */
-		if (fdtab[cur_fd].iocb == sock_accept_iocb) {
-			const struct listener *l = fdtab[cur_fd].owner;
+		if (!_getsocks_send_one(fd, cur_fd, rx, &msghdr, tmpbuf,
+		                        tmpfd, &nb_queued, &curoff))
+			goto out;
+	}
 
-			if (l->rx.settings->interface) {
-				if_name = l->rx.settings->interface;
-				if_nlen = strlen(if_name);
-			}
-
-#ifdef USE_NS
-			if (l->rx.settings->netns) {
-				ns_name = l->rx.settings->netns->node.key;
-				ns_nlen = l->rx.settings->netns->name_len;
-			}
-#endif
-		}
-
-		/* put the FD into the CMSG_DATA */
-		tmpfd[nb_queued++] = cur_fd;
-
-		/* first block is <ns_name_len> <ns_name> */
-		tmpbuf[curoff++] = ns_nlen;
-		if (ns_nlen)
-			memcpy(tmpbuf + curoff, ns_name, ns_nlen);
-		curoff += ns_nlen;
-
-		/* second block is <if_name_len> <if_name> */
-		tmpbuf[curoff++] = if_nlen;
-		if (if_nlen)
-			memcpy(tmpbuf + curoff, if_name, if_nlen);
-		curoff += if_nlen;
-
-		/* we used to send the listener options here before 2.3 */
-		memset(tmpbuf + curoff, 0, sizeof(int));
-		curoff += sizeof(int);
-
-		/* there's a limit to how many FDs may be sent at once */
-		if (nb_queued == MAX_SEND_FD) {
-			iov.iov_len = curoff;
-			if (sendmsg(fd, &msghdr, 0) != curoff) {
-				ha_warning("Failed to transfer sockets\n");
-				goto out;
-			}
-
-			/* Wait for an ack */
-			do {
-				ret = recv(fd, &tot_fd_nb, sizeof(tot_fd_nb), 0);
-			} while (ret == -1 && errno == EINTR);
-
-			if (ret <= 0) {
-				ha_warning("Unexpected error while transferring sockets\n");
-				goto out;
-			}
-			curoff = 0;
-			nb_queued = 0;
-		}
+	for (foreign_idx = 0; foreign_idx < nb_foreign; foreign_idx++) {
+		if (!_getsocks_send_one(fd, foreign_fds[foreign_idx],
+		                        foreign_rxs[foreign_idx], &msghdr,
+		                        tmpbuf, tmpfd, &nb_queued, &curoff))
+			goto out;
 	}
 
 	already_sent = 1;
@@ -2642,6 +2725,10 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	}
 
 out:
+	for (foreign_idx = 0; foreign_idx < nb_foreign; foreign_idx++)
+		close(foreign_fds[foreign_idx]);
+	free(foreign_rxs);
+	free(foreign_fds);
 	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1)
 		ha_warning("Cannot make the unix socket non-blocking\n");
 	applet_set_eoi(appctx);
@@ -3904,8 +3991,7 @@ int mworker_cli_create_master_proxy(char **errmsg)
 	/* Does not init the default target the CLI applet, but must be done in
 	 * the request parsing code */
 	mworker_proxy->default_target = NULL;
-	mworker_proxy->next = proxies_list;
-	proxies_list = mworker_proxy;
+	main_proxies_register(mworker_proxy);
 
 	return 0;
 }

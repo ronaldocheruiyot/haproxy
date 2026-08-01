@@ -505,7 +505,7 @@ int httpclient_set_proxy(struct httpclient *hc, struct proxy *px)
 
 	hc->px = px;
 
-	for (srv = px->srv; srv != NULL; srv = srv->next) {
+	list_for_each_entry(srv, &px->servers, el_px) {
 		if (srv->xprt == xprt_get(XPRT_RAW)) {
 			hc->srv_raw = srv;
 #ifdef USE_OPENSSL
@@ -1207,8 +1207,7 @@ struct proxy *httpclient_create_proxy(const char *id)
 #endif
 
 	/* add the proxy in the proxy list only if everything is successful */
-	px->next = proxies_list;
-	proxies_list = px;
+	main_proxies_register(px);
 
 	if (httpclient_resolve_init(px) != 0) {
 		memprintf(&errmsg, "cannot initialize resolvers.");
@@ -1278,7 +1277,7 @@ static int httpclient_postcheck_proxy(struct proxy *curproxy)
 #ifdef USE_OPENSSL
 	/* initialize the SNI for the SSL servers */
 
-	for (srv = curproxy->srv; srv != NULL; srv = srv->next) {
+	list_for_each_entry(srv, &curproxy->servers, el_px) {
 		if (srv->xprt == xprt_get(XPRT_SSL)) {
 			srv_ssl = srv;
 		}

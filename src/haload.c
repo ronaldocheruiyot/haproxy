@@ -61,6 +61,9 @@ struct hld_thr_info {
 	uint64_t *ttfb_pct;          // counts per ttfb value for percentile
 	uint64_t *ttlb_pct;          // counts per ttlb value for percentile
 	uint64_t tot_sc[5];          // total status codes on this thread: 1xx,2xx,3xx,4xx,5xx
+	uint64_t vtot_sc[HLD_HTTP_VER_MAX][5]; // by version total status codes
+	                                       // on this thread: 1xx,2xx,3xx,4xx,5xx
+	struct task *rate_task;      // task used when <arg_rate> is set
 	__attribute__((aligned(64))) union { } __pad;
 };
 
@@ -94,18 +97,20 @@ int arg_head;          // use HEAD
 int arg_hscd;          // HTTP status code distribution
 int arg_long;          // long output format; 2=raw values
 int arg_mreqs = 1;     // max concurrent streams by connection
+int arg_rate;          // connection & request rate limit
 int arg_rcon = -1;     // max requests per conn
 int arg_reqs = -1;     // max total requests
 int arg_serr;          // stop on first error
 int arg_slow;          // slow start: delay in milliseconds
-int arg_thrd = -1;     // number of threads
+int arg_thrd;          // number of threads
 int arg_usr = 1;       // number of users
 int arg_wait = 10000;  // I/O time out (ms)
 
 int all_usr_stop_asap; // all users must stop as soon as possible
 int usr_tid;
 int usr_cnt;           // user counter incremented by <mtask> main task
-int running_usrs;      // user counter decremented each time a user is released
+int running_tasks;     // tasks counter for the users and for the conn rate
+unsigned int hld_ver_flags; // flags to identify the HTTP versions used
 
 char *hld_args[MAX_LINE_ARGS + 1];
 
@@ -268,8 +273,7 @@ static inline void hld_rotate_freq_ctr(struct hld_freq_ctr *ctr,
  * rotated if the period is over. It is important that it correctly initializes
  * a null area.
  */
-__attribute__((unused))
-static inline void hdl_update_freq_ctr(struct hld_freq_ctr *ctr, uint32_t inc,
+static inline void hld_update_freq_ctr(struct hld_freq_ctr *ctr, uint32_t inc,
                                        const struct timeval now)
 {
 	if (ctr->curr_sec == now.tv_sec) {
@@ -569,17 +573,25 @@ void hld_summary(void)
 {
 	int th;
 	uint64_t cur_conn, tot_conn, tot_req, tot_err, tot_rcvd, bytes;
-	uint64_t tot_ttfb, tot_ttlb, tot_fbs, tot_lbs, tot_sc[5];
+	uint64_t tot_ttfb, tot_ttlb, tot_fbs, tot_lbs, tot_sc[5], vtot_sc[HLD_HTTP_VER_MAX][5];
 	static uint64_t prev_totc, prev_totr, prev_totb;
-	static uint64_t prev_ttfb, prev_ttlb, prev_fbs, prev_lbs, prev_sc[5];
+	static uint64_t prev_ttfb, prev_ttlb, prev_fbs, prev_lbs, prev_sc[5],
+	                prev_vsc[HLD_HTTP_VER_MAX][5];
 	static struct timeval prev_date = TV_UNSET;
 	double interval;
 
 	cur_conn = tot_conn = tot_req = tot_err = tot_rcvd = 0;
 	tot_ttfb = tot_ttlb = tot_fbs = tot_lbs = 0;
-	tot_sc[0] = tot_sc[1] = tot_sc[2] = tot_sc[3] = tot_sc[4] = 0;
+	if (arg_hscd)
+		tot_sc[0] = tot_sc[1] = tot_sc[2] = tot_sc[3] = tot_sc[4] = 0;
+	if (arg_hscd == 2) {
+		int v;
 
-	for (th = 0; th < global.nbthread; th++) {
+		for (v = HLD_HTTP_VER_0; v < HLD_HTTP_VER_MAX; v++)
+			vtot_sc[v][0] = vtot_sc[v][1] = vtot_sc[v][2] = vtot_sc[v][3] = vtot_sc[v][4] = 0;
+	}
+
+	for (th = 0; th < arg_thrd; th++) {
 		cur_conn += HA_ATOMIC_LOAD(&thrs_info[th].curconn);
 		tot_conn += HA_ATOMIC_LOAD(&thrs_info[th].tot_conn);
 		tot_req  += HA_ATOMIC_LOAD(&thrs_info[th].tot_done);
@@ -589,11 +601,29 @@ void hld_summary(void)
 		tot_ttlb += HA_ATOMIC_LOAD(&thrs_info[th].tot_ttlb);
 		tot_fbs  += HA_ATOMIC_LOAD(&thrs_info[th].tot_fbs);
 		tot_lbs  += HA_ATOMIC_LOAD(&thrs_info[th].tot_lbs);
-		tot_sc[0]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[0]);
-		tot_sc[1]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[1]);
-		tot_sc[2]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[2]);
-		tot_sc[3]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[3]);
-		tot_sc[4]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[4]);
+		if (arg_hscd) {
+			tot_sc[0]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[0]);
+			tot_sc[1]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[1]);
+			tot_sc[2]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[2]);
+			tot_sc[3]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[3]);
+			tot_sc[4]+= HA_ATOMIC_LOAD(&thrs_info[th].tot_sc[4]);
+		}
+		if (arg_hscd == 2) {
+			int v;
+
+			for (v = HLD_HTTP_VER_0; v < HLD_HTTP_VER_MAX; v++) {
+				if (!(hld_ver_flags & (1U << v)))
+				    continue;
+
+				vtot_sc[v][0]+= HA_ATOMIC_LOAD(&thrs_info[th].vtot_sc[v][0]);
+				vtot_sc[v][1]+= HA_ATOMIC_LOAD(&thrs_info[th].vtot_sc[v][1]);
+				vtot_sc[v][2]+= HA_ATOMIC_LOAD(&thrs_info[th].vtot_sc[v][2]);
+				vtot_sc[v][3]+= HA_ATOMIC_LOAD(&thrs_info[th].vtot_sc[v][3]);
+				vtot_sc[v][4]+= HA_ATOMIC_LOAD(&thrs_info[th].vtot_sc[v][4]);
+			}
+		}
+
+
 	}
 
 	if (tv_isset(&prev_date))
@@ -657,14 +687,31 @@ void hld_summary(void)
 
 	/* status codes distribution */
 	if (arg_hscd)
-		printf("%3llu %3llu %3llu %3llu %3llu ",
+		printf("%3llu %3llu %3llu %3llu %3llu",
 		       (unsigned long long)(tot_sc[0] - prev_sc[0]),
 		       (unsigned long long)(tot_sc[1] - prev_sc[1]),
 		       (unsigned long long)(tot_sc[2] - prev_sc[2]),
 		       (unsigned long long)(tot_sc[3] - prev_sc[3]),
 		       (unsigned long long)(tot_sc[4] - prev_sc[4]));
+	if (arg_hscd == 2) {
+		int v;
+
+		for (v = HLD_HTTP_VER_0; v < HLD_HTTP_VER_MAX; v++) {
+			if (!(hld_ver_flags & (1U << v)))
+				continue;
+
+			printf("     %3llu %3llu %3llu %3llu %3llu",
+			       (unsigned long long)(vtot_sc[v][0] - prev_vsc[v][0]),
+			       (unsigned long long)(vtot_sc[v][1] - prev_vsc[v][1]),
+			       (unsigned long long)(vtot_sc[v][2] - prev_vsc[v][2]),
+			       (unsigned long long)(vtot_sc[v][3] - prev_vsc[v][3]),
+			       (unsigned long long)(vtot_sc[v][4] - prev_vsc[v][4]));
+		}
+
+	}
 
 	putchar('\n');
+	fflush(stdout);
 
 	prev_totc = tot_conn;
 	prev_totr = tot_req;
@@ -673,11 +720,24 @@ void hld_summary(void)
 	prev_lbs  = tot_lbs;
 	prev_ttfb = tot_ttfb;
 	prev_ttlb = tot_ttlb;
-	prev_sc[0]= tot_sc[0];
-	prev_sc[1]= tot_sc[1];
-	prev_sc[2]= tot_sc[2];
-	prev_sc[3]= tot_sc[3];
-	prev_sc[4]= tot_sc[4];
+	if (arg_hscd) {
+		prev_sc[0]= tot_sc[0];
+		prev_sc[1]= tot_sc[1];
+		prev_sc[2]= tot_sc[2];
+		prev_sc[3]= tot_sc[3];
+		prev_sc[4]= tot_sc[4];
+	}
+	if (arg_hscd == 2) {
+		int v;
+
+		for (v = HLD_HTTP_VER_0; v < HLD_HTTP_VER_MAX; v++) {
+			prev_vsc[v][0] = vtot_sc[v][0];
+			prev_vsc[v][1] = vtot_sc[v][1];
+			prev_vsc[v][2] = vtot_sc[v][2];
+			prev_vsc[v][3] = vtot_sc[v][3];
+			prev_vsc[v][4] = vtot_sc[v][4];
+		}
+	}
 	prev_date = hld_now;
 }
 
@@ -766,13 +826,24 @@ static struct task *mtask_cb(struct task *t, void *context, unsigned int state)
 				   "    err  cps  rps  bps   ttfb");
 		if (arg_hscd)
 			printf(" 1xx 2xx 3xx 4xx 5xx");
+		if (arg_hscd == 2) {
+			int i;
+
+			for (i = 0 ; i < 4; i++) {
+				if (!(hld_ver_flags & (1 << i)))
+					continue;
+				printf("   (h%d)1xx 2xx 3xx 4xx 5xx", i);
+			}
+		}
+
+
 		putchar('\n');
 	}
 
 	update_throttle();
 	if (tick_is_expired(mtask.show_time, now_ms)) {
 		hld_summary();
-		if (!HA_ATOMIC_LOAD(&running_usrs)) {
+		if (!HA_ATOMIC_LOAD(&running_tasks)) {
 			task_destroy(t);
 			t = NULL;
 			hld_dealloc_thrs_info();
@@ -788,11 +859,11 @@ static struct task *mtask_cb(struct task *t, void *context, unsigned int state)
 	}
 
 	/* users initializations */
-	if (usr_cnt < arg_usr) {
+	if (!arg_rate && usr_cnt < arg_usr) {
 		if (throttle) {
 			int i, nb_usr;
 
-			for (i = 0; i < global.nbthread; i++) {
+			for (i = 0; i < arg_thrd; i++) {
 				nb_usr = mul32hi(thrs_info[i].maxusrs, throttle);
 				nb_usr = nb_usr ? nb_usr : 1;
 
@@ -806,7 +877,7 @@ static struct task *mtask_cb(struct task *t, void *context, unsigned int state)
 						break;
 					}
 
-					HA_ATOMIC_INC(&running_usrs);
+					HA_ATOMIC_INC(&running_tasks);
 					usr_cnt++;
 				}
 			}
@@ -822,17 +893,20 @@ static struct task *mtask_cb(struct task *t, void *context, unsigned int state)
 				struct hld_usr *hu;
 				int req = arg_reqs == -1 ? -1 : (arg_reqs + usr_cnt) / arg_usr;
 
-				hu = hld_new_usr(req, usr_tid++ % global.nbthread);
+				hu = hld_new_usr(req, usr_tid++ % arg_thrd);
 				if (!hu) {
 					ha_alert("could not allocate a new haload user\n");
 					break;
 				}
 			}
 
-			HA_ATOMIC_ADD(&running_usrs, nb_usr);
+			HA_ATOMIC_ADD(&running_tasks, nb_usr);
 			task_wakeup(t, TASK_WOKEN_IO);
 		}
 
+	}
+	else if (arg_rate && HA_ATOMIC_LOAD(&running_tasks) <= arg_usr) {
+		t->expire = tick_first(tick_add(now_ms, MS_TO_TICKS(100)), mtask.show_time);
 	}
 	else
 		t->expire = tick_add(now_ms, MS_TO_TICKS(1000));
@@ -1006,7 +1080,11 @@ static void hldstream_htx_buf_rcv(struct connection *conn,
 			TRACE_PRINTF(TRACE_LEVEL_PROTO, HLD_STRM_EV_RX, hs, 0, 0, 0,
 			             "HTTP status: %d cur_read=%d",
 			             status, (int)cur_read);
-			thrs_info[tid].tot_sc[status * 41 / 4096 - 1]++;
+			if (arg_hscd)
+				thrs_info[tid].tot_sc[status * 41 / 4096 - 1]++;
+			if (arg_hscd == 2) {
+				thrs_info[tid].vtot_sc[hs->url->cfg->http_ver][status * 41 / 4096 - 1]++;
+			}
 			if (hs->url->tot_req > 1 || !arg_accu) {
 				ttfb = tv_us(tv_diff(&hs->req_date, &date));
 				thrs_info[tid].tot_fbs++;
@@ -1102,6 +1180,31 @@ static int hld_be_reuse_conn(struct connection **conn, int64_t *hash,
 	return ret;
 }
 
+/* Schedule <urs> user, depending on <rate> conn/req rate value */
+static inline void hld_usr_schedule(struct hld_usr *usr, int rate)
+{
+	uint32_t max, wait;
+	struct hld_thr_info *ti = &thrs_info[tid];
+	uint32_t maxusrs = ti->maxusrs;
+
+	if (throttle) {
+		maxusrs = mul32hi(maxusrs, throttle);
+		maxusrs = maxusrs ? maxusrs : 1;
+	}
+
+	if (ti->curusrs < maxusrs && throttle)
+		max = 0;
+	else if (throttle)
+		max = (mul32hi(rate, throttle) + arg_thrd - 1) / arg_thrd;
+	else
+		max = (rate + arg_thrd - 1) / arg_thrd;
+
+	max = max ? max : 1;
+	wait = hld_next_event_delay(&ti->req_rate, max,
+	                            ti->curusrs - ti->cur_req, date);
+	task_schedule(usr->task, tick_add(now_ms, MS_TO_TICKS(wait)));
+}
+
 /* haload stream task handler */
 struct task *hld_strm_task(struct task *t, void *context, unsigned int state)
 {
@@ -1189,6 +1292,9 @@ struct task *hld_strm_task(struct task *t, void *context, unsigned int state)
 			goto err;
 		}
 
+		if (arg_rate)
+			hld_update_freq_ctr(&thrs_info[tid].conn_rate, 1, date);
+
 		conn_set_private(conn);
 		session_add_conn(sess, conn);
 		conn->ctx = hs->sc;
@@ -1262,6 +1368,7 @@ struct task *hld_strm_task(struct task *t, void *context, unsigned int state)
 	return t;
  done:
 	url->tot_rconn_done++;
+	thrs_info[tid].cur_req--;
 	BUG_ON(arg_rcon > 0 && url->tot_rconn_done > arg_rcon);
 	url->mreqs++;
 	if (arg_rcon > 0 && url->tot_rconn_done == arg_rcon) {
@@ -1274,30 +1381,35 @@ struct task *hld_strm_task(struct task *t, void *context, unsigned int state)
 		url->mreqs = arg_mreqs;
 	}
 
-	/* Note that the user task will release all the expired streams
-	 * attached to it.
-	 */
-	task_wakeup(usr->task, TASK_WOKEN_IO);
-
 	LIST_DELETE(&hs->list);
 	hldstream_free(&hs);
 	t = NULL;
 
-	if (LIST_ISEMPTY(&usr->strms))
-		usr->task->expire = TICK_ETERNITY;
+	/* Note that the user task will release all the expired streams
+	 * attached to it.
+	 */
+	if (!arg_rate) {
+		task_wakeup(usr->task, TASK_WOKEN_IO);
+		if (LIST_ISEMPTY(&usr->strms))
+			usr->task->expire = TICK_ETERNITY;
+		else {
+			/* Update the user task expiration from the first stream which
+			 * is also the stream with the oldest expiration time.
+			 */
+			first_hs = LIST_ELEM(usr->strms.n, struct hldstream *, list);
+			usr->task->expire = first_hs->expire;
+			task_queue(usr->task);
+		}
+	}
 	else {
-		/* Update the user task expiration from the first stream which
-		 * is also the stream with the oldest expiration time.
-		 */
-		first_hs = LIST_ELEM(usr->strms.n, struct hldstream *, list);
-		hs->usr->task->expire = first_hs->expire;
-		task_queue(hs->usr->task);
+		hld_usr_schedule(usr, arg_rate);
 	}
 
 	goto leave;
  err:
 	TRACE_DEVEL("leaving on error", HLD_STRM_EV_TASK, hs);
 	thrs_info[tid].tot_perr++;
+	thrs_info[tid].cur_req--;
 	url->mreqs++;
 	if (arg_rcon > 0) {
 		BUG_ON(!url->tot_rconn_sent);
@@ -1307,7 +1419,10 @@ struct task *hld_strm_task(struct task *t, void *context, unsigned int state)
 	/* Note that the user task will release all the expired streams
 	 * attached to it.
 	 */
-	task_wakeup(usr->task, TASK_WOKEN_IO);
+	if (!arg_rate)
+		task_wakeup(usr->task, TASK_WOKEN_IO);
+	else
+		hld_usr_schedule(usr, arg_rate);
 	LIST_DELETE(&hs->list);
 	hldstream_free(&hs);
 	t = NULL;
@@ -1409,6 +1524,8 @@ static inline void hld_usr_release(struct hld_usr **usr)
 	task_destroy((*usr)->task);
 	session_free((*usr)->sess);
 	ha_free(usr);
+
+	TRACE_LEAVE(HLD_EV_USR_TASK);
 }
 
 static struct task *hld_usr_task(struct task *t, void *context, unsigned int state)
@@ -1456,6 +1573,10 @@ static struct task *hld_usr_task(struct task *t, void *context, unsigned int sta
 				goto out;
 			}
 
+			if (arg_rate)
+				hld_update_freq_ctr(&thrs_info[tid].req_rate, 1, date);
+
+			thrs_info[tid].cur_req++;
 			url->cfg->cur_path = hld_next_path(url->cfg->paths, path);
 			BUG_ON(!url->mreqs || !usr->nreqs || !nreqs);
 
@@ -1501,7 +1622,7 @@ static struct task *hld_usr_task(struct task *t, void *context, unsigned int sta
 	}
 
 	if (((usr->flags & HLD_USR_FL_STOP) || !usr->nreqs) && LIST_ISEMPTY(&usr->strms)) {
-		HA_ATOMIC_DEC(&running_usrs);
+		HA_ATOMIC_DEC(&running_tasks);
 		hld_usr_release(&usr);
 		t = NULL;
 		goto out;
@@ -1552,7 +1673,6 @@ static inline struct hld_usr *hld_new_usr(int nreqs, int tid)
 		url->tot_rconn_done = 0;
 		url->tot_rconn_sent = 0;
 		url->mreqs = arg_mreqs;
-		url->flags = 0;
 		url->cfg = cfg;
 		url->next = usr->urls;
 		usr->urls = url;
@@ -1782,25 +1902,102 @@ void sigint_handler(int sig)
 /* Deallocate the thread information structs */
 static void hld_dealloc_thrs_info(void)
 {
+	int i;
+
+	if (!thrs_info)
+		return;
+
+	for (i = 0; i < arg_thrd; i++) {
+		task_destroy(thrs_info[i].rate_task);
+		thrs_info[i].rate_task = NULL;
+	}
+
 	free(thrs_info);
 	thrs_info = NULL;
+}
+
+/* Thread task launched to handle the connection and request rate */
+static struct task *hld_rate_task(struct task *t, void *context, unsigned int state)
+{
+	if (thrs_info[tid].curusrs < thrs_info[tid].maxusrs) {
+		int budget = -1;
+		uint32_t max;
+		uint32_t b1, b2;
+		int nb_usr = thrs_info[tid].maxusrs;
+
+		if (throttle) {
+			nb_usr = mul32hi(thrs_info[tid].maxusrs, throttle);
+			nb_usr = nb_usr ? nb_usr : 1;
+			max = (mul32hi(arg_rate, throttle) + arg_thrd - 1) / arg_thrd;
+		}
+		else
+			max = (arg_rate + arg_thrd - 1) / arg_thrd;
+
+		max = max ? max : 1;
+		b1 = hld_freq_ctr_remain(&thrs_info[tid].conn_rate, max, 0, date);
+		b2 = hld_freq_ctr_remain(&thrs_info[tid].req_rate, max,
+		                         thrs_info[tid].curusrs - thrs_info[tid].cur_req, date);
+		budget = (!b2 || b1 <= b2) ? b1 : b2;
+
+		while (thrs_info[tid].curusrs < nb_usr && budget--) {
+			struct hld_usr *hu;
+			int req = arg_reqs == -1 ? -1 : (arg_reqs + tid) / arg_usr;
+
+			hu = hld_new_usr(req, tid);
+			if (!hu) {
+				ha_alert("could not allocate a new haload user\n");
+				break;
+			}
+
+			HA_ATOMIC_INC(&running_tasks);
+		}
+
+		task_schedule(t, tick_add(now_ms, MS_TO_TICKS(100)));
+	}
+	else {
+		HA_ATOMIC_DEC(&running_tasks);
+		t->expire = TICK_ETERNITY;
+		task_destroy(t);
+		thrs_info[tid].rate_task = NULL;
+		t = NULL;
+	}
+
+	return t;
 }
 
 /* Allocate all thread information structs */
 static int hld_alloc_thrs_info(void)
 {
-	int i;
+	int i, ret = 0;
 
-	thrs_info = calloc(global.nbthread, sizeof(*thrs_info));
+	thrs_info = calloc(arg_thrd, sizeof(*thrs_info));
 	if (!thrs_info) {
 		ha_alert("failed to alloct threads information array.\n");
-		return 0;
+		goto out;
 	}
 
-	for (i = 0; i < global.nbthread; i++)
-		thrs_info[i].maxusrs = (arg_usr + i) / global.nbthread;
+	for (i = 0; i < arg_thrd; i++) {
+		thrs_info[i].maxusrs = (arg_usr + i) / arg_thrd;
+		if (arg_rate) {
+			struct task *t;
 
-	return 1;
+			t = task_new_on(i);
+			if (!t) {
+				ha_alert("could not allocate a new task for req rate\n");
+				goto out;
+			}
+
+			t->process = hld_rate_task;
+			t->expire = TICK_ETERNITY;
+			task_wakeup(t, TASK_WOKEN_INIT);
+			thrs_info[i].rate_task = t;
+			HA_ATOMIC_INC(&running_tasks);
+		}
+	}
+
+	ret = 1;
+ out:
+	return ret;
 }
 
 static int hld_init(void)
@@ -1812,19 +2009,33 @@ static int hld_init(void)
 		throttle = 1;
 
 	if (!hld_cfg_finalize())
-		goto leave;
+		goto err;
+
+	/* This is the location to initialize the default value for <arg_thrd>.
+	 * Indeed, global.nthread is initialized late(after the parsing step).
+	 */
+	if (arg_thrd == 0)
+		arg_thrd = global.nbthread;
+
+	if (arg_rate && arg_thrd > arg_usr) {
+		ha_alert("Thread count (%d) must not exceed connection count (%d)\n",
+		         arg_thrd, arg_usr);
+		goto err;
+	}
+
+	BUG_ON(arg_thrd != global.nbthread);
 
 	/* Consider the case where <arg_reqs> < <arg_usr> */
 	if (arg_reqs != -1 && arg_reqs < arg_usr)
 		arg_usr = arg_reqs;
 
 	if (!hld_alloc_thrs_info())
-		goto leave;
+		goto err;
 
 	mtask.t = task_new_here();
 	if (mtask.t == NULL) {
 		ha_alert("could start main task\n");
-		goto leave;
+		goto err;
 	}
 
 	mtask.t->process = mtask_cb;
@@ -1846,5 +2057,8 @@ static int hld_init(void)
  leave:
 	ha_free(&errmsg);
 	return ret;
+ err:
+	hld_dealloc_thrs_info();
+	goto leave;
 }
 REGISTER_POST_CHECK(hld_init);
